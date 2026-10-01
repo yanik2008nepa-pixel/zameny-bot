@@ -10,7 +10,6 @@ import io
 import logging
 import os
 import re
-import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -276,7 +275,7 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
-    now = time.monotonic()
+    now = msg.date.timestamp()  # время отправки сообщения, а не обработки: бот обрабатывает по очереди
     if _muted_until.get(user.id, 0) > now:
         raise ApplicationHandlerStop  # игнор, пока действует мут
     q = _recent[user.id]
@@ -439,7 +438,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(MessageHandler(filters.ALL, antispam), group=-1)  # проверка на спам идёт первой
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
