@@ -27,7 +27,24 @@ TZ = ZoneInfo("Europe/Minsk")
 API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
-KEYBOARD = ReplyKeyboardMarkup([["Замены"]], resize_keyboard=True, is_persistent=True)  # кнопка внизу
+KEYBOARD = ReplyKeyboardMarkup(
+    [["Замены", "Есть ли замены?"], ["Пары завтра"]], resize_keyboard=True, is_persistent=True
+)  # кнопки внизу
+
+# Расписание группы по дням недели (0 = понедельник ... 5 = суббота).
+# Номер в списке = номер урока (1-й элемент = урок 1). Пустая строка = урока нет.
+SCHEDULE = {
+    0: ["УП Измерительная"] * 6,
+    1: ["Физ.культ. и здоровье", "Деловые коммуникации", "Электропривод", "Электропривод",
+        "Основы автоматики", "Основы автоматики"],
+    2: ["Электронная техника", "Электронная техника", "Основы автоматики", "Основы автоматики",
+        "УиСПИ", "УиСПИ", "Защ нас. и терр от ЧС", "Защ нас. и терр от ЧС"],
+    3: ["Физ.культ. и здоровье", "Деловые коммуникации", "Осн.теории надежности", "Осн.теории надежности",
+        "Цифр.и микропр.техника", "Цифр.и микропр.техника"],
+    4: ["МиСИ", "МиСИ", "Электронная техника", "Электронная техника", "Электропривод", "Электропривод"],
+    5: ["Физ.культ. и здоровье", "УиСПИ", "Цифр.и микропр.техника", "Цифр.и микропр.техника",
+        "МНиЭПА", "МНиЭПА"],
+}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("zameny")
@@ -236,6 +253,107 @@ def make_reply(day: date, debug: bool = False) -> str:
     return dbg if debug else build_message(day, changes, info)
 
 
+def lessons_of(pdf_bytes: bytes):
+    """Замены группы по номерам уроков и инфо-час: ({урок: данные}, инфо-час | None)."""
+    found, info = None, None
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            lines = page_lines(page)
+            if not lines:
+                raise ValueError("В PDF нет текста (похоже, это скан).")
+            rows, tails = split_rows(lines)
+            if not rows:
+                continue
+            lessons, raw, _ = collect_group(rows, GROUP_CODE)
+            info = info or info_hour(tails)
+            if raw and found is None:
+                found = lessons
+    return found or {}, info
+
+
+def merge_day(day: date, changes: dict):
+    """Расписание дня с наложенными заменами: [(номера уроков, текст, было | None)]."""
+    base = SCHEDULE.get(day.weekday(), [])
+    items = []
+    for num in range(1, max([len(base)] + list(changes)) + 1):
+        plan = base[num - 1] if num <= len(base) else ""
+        text, was = plan, None
+        d = changes.get(num)
+        if d:
+            old = fmt(d["os"], d["ot"], d["oa"])
+            new = fmt(d["ns"], d["nt"], d["na"])
+            if new and new != old:
+                text, was = ("урок снят" if new.lower().startswith("урок снят") else new), plan
+        if not text:
+            continue
+        if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1:
+            items[-1][0].append(num)
+        else:
+            items.append(([num], text, was))
+    return items
+
+
+def make_schedule_reply(day: date) -> str:
+    item = find_pdf(day)
+    changes, info = {}, None
+    if item is not None:
+        changes, info = lessons_of(download(item))
+    lines = []
+    for nums, text, was in merge_day(day, changes):
+        label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
+        if text == "урок снят":
+            lines.append(f"• {label}: ❌ урок снят" + (f" (было: {was})" if was else ""))
+        elif was is None:
+            lines.append(f"• {label}: {text}")
+        else:
+            lines.append(f"• {label}: 🔄 {text} (по расписанию: {was or 'нет'})")
+    head = f"📚 Пары на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
+    body = "\n".join(lines) if lines else "Занятий нет"
+    if item is None:
+        body += "\n\nℹ️ Замены на этот день пока не выложены, показано обычное расписание."
+    elif any("🔄" in l or "❌" in l for l in lines):
+        body += "\n\n🔄 — замена по сравнению с расписанием"
+    else:
+        body += "\n\nЗамен нет, всё по расписанию."
+    if info:
+        body += f"\n\n🕐 Информационный час: {info}"
+    return f"{head}\n\n{body}"
+
+
+async def lessons_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    day = next_workday(datetime.now(TZ).date())
+    try:
+        reply = await asyncio.to_thread(make_schedule_reply, day)
+    except Exception as e:  # noqa: BLE001
+        log.exception("ошибка расписания")
+        reply = f"Не получилось собрать расписание: {e}"
+    await update.message.reply_text(reply[:4000], reply_markup=KEYBOARD)
+
+
+def next_workday(today: date) -> date:
+    """Завтрашний день; если это воскресенье - понедельник."""
+    d = today + timedelta(days=1)
+    if d.weekday() == 6:
+        d += timedelta(days=1)
+    return d
+
+
+async def check_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    day = next_workday(datetime.now(TZ).date())
+    title = f"{DAYS[day.weekday()]} {day:%d.%m.%Y}"
+    try:
+        item = await asyncio.to_thread(find_pdf, day)
+    except Exception:  # noqa: BLE001
+        log.exception("ошибка проверки")
+        await update.message.reply_text("Не удалось проверить Яндекс Диск. Попробуйте позже.", reply_markup=KEYBOARD)
+        return
+    if item is None:
+        text = f"❌ Замен на {title} пока нет."
+    else:
+        text = f"✅ Замены на {title} уже выложены. Нажмите «Замены», чтобы посмотреть."
+    await update.message.reply_text(text, reply_markup=KEYBOARD)
+
+
 async def zameny(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     today = datetime.now(TZ).date()
@@ -249,7 +367,7 @@ async def zameny(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не понял дату. Пример: Замены 05.10", reply_markup=KEYBOARD)
             return
     else:
-        day = today + timedelta(days=1)
+        day = next_workday(today)
     debug = text.lower().lstrip().startswith("debug")
     try:
         reply = await asyncio.to_thread(make_reply, day, debug)
@@ -261,7 +379,7 @@ async def zameny(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Нажмите кнопку «Замены» внизу, и я покажу замены на завтра для " + GROUP_NAME,
+        "«Есть ли замены?» - проверить, выложены ли замены на завтра. «Замены» - показать замены. «Пары завтра» - расписание на завтра с учётом замен. Группа " + GROUP_NAME,
         reply_markup=KEYBOARD,
     )
 
@@ -270,6 +388,8 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары завтра"), lessons_tomorrow))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(замен|debug)"), zameny))
     app.run_webhook(
         listen="0.0.0.0",
