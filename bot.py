@@ -5,6 +5,7 @@
   Замены 05.10      - замены на конкретную дату (или день недели: Замены пятница)
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
   Спонсоры          - список спонсоров
+  Расписание        - кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
   Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
@@ -24,10 +25,10 @@ from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
-from telegram.ext import (Application, ApplicationHandlerStop, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
@@ -39,7 +40,7 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["🤝 Спонсоры"]], resize_keyboard=True, is_persistent=True
+    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["🤝 Спонсоры", "📅 Расписание"]], resize_keyboard=True, is_persistent=True
 )  # кнопки внизу
 
 # Расписание группы по дням недели (0 = понедельник ... 5 = суббота).
@@ -684,6 +685,88 @@ async def lessons_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply[:4000], reply_markup=KEYBOARD)
 
 
+# ---------- Расписание по дням недели (кнопка «📅 Расписание») ----------
+
+WD_ABBR = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
+CB_COUNT, CB_WINDOW = 8, 5.0  # не больше 8 нажатий за 5 секунд от одного человека
+_cb_recent = defaultdict(lambda: deque(maxlen=CB_COUNT))
+
+
+def nearest_date(wd: int, today: date) -> date:
+    """Ближайшая дата с таким днём недели, считая сегодняшний."""
+    return today + timedelta(days=(wd - today.weekday()) % 7)
+
+
+def schedule_markup(sel=None, mode="d"):
+    """Кнопки Пн-Сб (сегодня помечен точкой, выбранный - в скобках) и переключатель замен."""
+    today_wd = datetime.now(TZ).date().weekday()
+    btns = []
+    for i, ab in enumerate(WD_ABBR):
+        label = ab + (" •" if i == today_wd else "")
+        if i == sel:
+            label = f"[{label}]"
+        btns.append(InlineKeyboardButton(label, callback_data=f"sch:d:{i}"))
+    rows = [btns[:3], btns[3:]]
+    if sel is not None:
+        if mode == "r":
+            rows.append([InlineKeyboardButton("📋 Без замен", callback_data=f"sch:d:{sel}")])
+        else:
+            rows.append([InlineKeyboardButton("🔄 С заменами", callback_data=f"sch:r:{sel}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def make_plain_schedule(wd: int) -> str:
+    today = datetime.now(TZ).date()
+    day = nearest_date(wd, today)
+    lines = []
+    for nums, text, _ in merge_day(day, {}):
+        label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
+        lines.append(f"• {label}: {text}")
+    body = "\n".join(lines) if lines else "Занятий нет"
+    return (f"📅 {DAYS[wd].capitalize()} — расписание без замен, группа {GROUP_NAME}\n\n{body}\n\n"
+            f"Замены на ближайшую дату ({day:%d.%m}) — кнопка «🔄 С заменами».")
+
+
+async def schedule_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📅 Выбери день недели — покажу расписание без замен.",
+                                    reply_markup=schedule_markup())
+
+
+async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    now = datetime.now().timestamp()
+    recent = _cb_recent[q.from_user.id]
+    recent.append(now)
+    if len(recent) == CB_COUNT and now - recent[0] <= CB_WINDOW:
+        await q.answer("Не так быстро 🙂")
+        return
+    try:
+        _, mode, num = q.data.split(":")
+        wd = int(num)
+    except ValueError:
+        await q.answer()
+        return
+    if mode not in ("d", "r") or not 0 <= wd < len(WD_ABBR):
+        await q.answer()
+        return
+    await q.answer()  # сразу убираем «часики» на кнопке
+    track(update, cat="расписание", when=datetime.now(TZ))
+    if mode == "d":
+        text = make_plain_schedule(wd)
+    else:
+        day = nearest_date(wd, datetime.now(TZ).date())
+        try:
+            text = await asyncio.to_thread(make_schedule_reply, day)
+        except Exception as e:  # noqa: BLE001
+            log.exception("ошибка расписания")
+            text = f"Не получилось собрать расписание: {e}"
+    try:
+        await q.edit_message_text(text[:4000], reply_markup=schedule_markup(wd, mode))
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():  # повторное нажатие на тот же день - не ошибка
+            raise
+
+
 # ---------- Подписка, уведомления, утреннее расписание ----------
 
 def set_sub(chat_id: int, on: bool):
@@ -781,15 +864,17 @@ def classify(text):
         return "уведомления"
     if "спонсор" in t:
         return "спонсоры"
+    if "расписан" in t:
+        return "расписание"
     return "другое"
 
 
-def track(update: Update, spam: bool = False):
+def track(update: Update, spam: bool = False, cat=None, when=None):
     msg, user = update.effective_message, update.effective_user
     st = DATA["stats"]
-    day = msg.date.astimezone(TZ).date().isoformat()
+    day = (when or msg.date).astimezone(TZ).date().isoformat()
     d = st["days"].setdefault(day, {"msgs": 0, "users": {}, "cats": {}, "spam": 0})
-    uid, cat = str(user.id), classify(msg.text)
+    uid, cat = str(user.id), cat or classify(msg.text)
     d["msgs"] += 1
     d["users"][uid] = d["users"].get(uid, 0) + 1
     d["cats"][cat] = d["cats"].get(cat, 0) + 1
@@ -897,6 +982,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "«Замены» — замены на завтра. «Есть ли замены?» — выложены ли они. "
         "«Пары завтра» — расписание с учётом замен.\n"
+        "«📅 Расписание» — расписание на любой день недели (Пн–Сб), там же можно глянуть замены.\n"
         "«🤝 Спонсоры» — наши партнёры.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         "🔔 Я включил уведомления: напишу сам, когда выложат замены, и в 7:00 пришлю расписание на день. "
@@ -918,6 +1004,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(📅\s*)?расписан"), schedule_button))
+    app.add_handler(CallbackQueryHandler(schedule_cb, pattern=r"^sch:"))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🤝\s*)?спонсор"), sponsors))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(замен|debug)"), zameny))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(привет|здаров|здравствуй|хай|ку)\b"), talk(GREET)))
