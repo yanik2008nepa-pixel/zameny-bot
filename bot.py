@@ -10,13 +10,16 @@ import io
 import logging
 import os
 import re
+import time
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
 from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (Application, ApplicationHandlerStop, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
@@ -184,7 +187,7 @@ def lessons_to_lines(lessons):
             rows.append(([num], (old, new)))
     out = []
     for nums, (old, new) in rows:
-        label = f"Пара {nums[0]}" if len(nums) == 1 else f"Пары {nums[0]}–{nums[-1]}"
+        label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
         if new.lower().startswith("урок снят"):
             out.append(f"• {label}: урок снят (было: {old})")
         else:
@@ -233,6 +236,56 @@ def analyze(pdf_bytes: bytes):
         debug.append(f"Группа {GROUP_CODE} в таблице не найдена.")
     debug.append(f"Информационный час: {info or 'нет'}")
     return changes, info, "\n".join(debug)
+
+
+# ---------- Антиспам ----------
+
+SPAM_COUNT = 4      # столько сообщений ...
+SPAM_WINDOW = 10    # ... за столько секунд = спам
+SPAM_MUTE = 120     # на сколько секунд бот игнорирует спамера
+_recent = defaultdict(lambda: deque(maxlen=SPAM_COUNT))
+_muted_until = {}
+
+SPAM_REPLY = (
+    "🖕 ВСЁ. СТОП. ХВАТИТ. Ты что, решил завалить меня сообщениями? Поздравляю, ты достиг цели: "
+    "я устал, я зол, и я посылаю тебя. Далеко. Очень далеко. И надолго.\n\n"
+    "Иди-ка ты погуляй. Прямо сейчас. Выйди на улицу, подыши воздухом, посмотри на небо, "
+    "найди там птичек, облака, деревья — всё то, что НЕ требует от тебя тыкать кнопки с частотой пулемёта. "
+    "Дальше иди. Ещё дальше. До самого горизонта и за него. Там, за горизонтом, тоже есть горизонт — "
+    "вот к нему и иди.\n\n"
+    "Ты думаешь, что чем чаще нажмёшь, тем быстрее я отвечу? Нет, дорогой друг. Я не ускоряюсь. "
+    "Я не становлюсь умнее от спама. Я становлюсь только злее, а ты — ближе к бану. "
+    "Замены не появятся от того, что ты нажал кнопку пять раз подряд. Расписание не поменяется. "
+    "Преподаватели не придут быстрее. Единственное, что произойдёт, — я включу режим «не слышу тебя».\n\n"
+    "И да, я его включаю. Следующие две минуты ты для меня не существуешь. Пиши что хочешь, "
+    "жми что хочешь — я буду молчать, как рыба об лёд, как партизан на допросе, как расписание "
+    "в понедельник утром.\n\n"
+    "Пока меня нет, можешь заняться полезным делом:\n"
+    "• выучить предметы, которые стоят в расписании;\n"
+    "• сделать то, что задавали (да-да, ты помнишь);\n"
+    "• выпить воды и успокоиться;\n"
+    "• посидеть в тишине и подумать о своём поведении;\n"
+    "• ещё раз сходить погулять — слишком далеко ты, видимо, не дошёл.\n\n"
+    "Через две минуты, если научишься нажимать кнопки по одному разу, как нормальный человек, "
+    "я снова стану добрым и вежливым ботом. А пока — до свидания. Нет, не «до скорого». "
+    "Именно «до свидания». Надолго. Иди. 👋"
+)
+
+
+async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    now = time.monotonic()
+    if _muted_until.get(user.id, 0) > now:
+        raise ApplicationHandlerStop  # игнор, пока действует мут
+    q = _recent[user.id]
+    q.append(now)
+    if len(q) == SPAM_COUNT and now - q[0] <= SPAM_WINDOW:
+        _muted_until[user.id] = now + SPAM_MUTE
+        q.clear()
+        await msg.reply_text(SPAM_REPLY[:4000])
+        raise ApplicationHandlerStop
 
 
 # ---------- Ответ ----------
@@ -387,6 +440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.ALL, antispam), group=-1)  # проверка на спам идёт первой
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары завтра"), lessons_tomorrow))
