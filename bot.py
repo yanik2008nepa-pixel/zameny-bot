@@ -218,7 +218,87 @@ def fmt(subj, teach, aud):
     return s
 
 
-def lessons_to_lines(lessons):
+# ---------- Кабинеты преподавателей из боковой панели (только для замен) ----------
+# Справа от таблицы в PDF написано примерно так: "Иванов И.И. (1-4, 6) 205".
+# Из этого берём: фамилия -> какие уроки -> какой кабинет.
+
+_NAME = r"[А-ЯЁ][А-Яа-яЁё\-]+"
+ENTRY = re.compile(rf"({_NAME})((?:\s+[А-ЯЁ]\.\s?(?:[А-ЯЁ]\.)?)?)\s*\(([^()]*\d[^()]*)\)")
+ROOM_AFTER = re.compile(
+    r"^[\s:;,–—\-=]*(?:(?:ауд|каб|кабинет|к)\b\.?\s*)?"
+    r"(\d[\w\-/]*|спорт\.?\s?зал\w*|акт\.?\s?зал\w*|[а-яё]*зал\w*)", re.I)
+ROOM_ANY = re.compile(r"(?:^|[\s:;,(])(?:(?:ауд|каб|кабинет|к)\b\.?\s*)?(\d[\w\-/]*)", re.I)
+
+
+def parse_lesson_set(s):
+    """'1,2,3,5-8' -> {1,2,3,5,6,7,8} (тире любого вида)."""
+    nums = set()
+    for a, b in re.findall(r"(\d+)\s*[-–—]\s*(\d+)", s):
+        if int(a) <= int(b) <= 12:
+            nums.update(range(int(a), int(b) + 1))
+    rest = re.sub(r"\d+\s*[-–—]\s*\d+", " ", s)
+    nums.update(int(x) for x in re.findall(r"\d+", rest) if int(x) <= 12)
+    return nums
+
+
+def _norm(s):
+    return s.lower().replace("ё", "е")
+
+
+def parse_rooms(tails):
+    """Список записей [{'name', 'init', 'lessons', 'room'}] из текста справа от таблицы."""
+    out = []
+    for ln in tails:
+        found = list(ENTRY.finditer(ln))
+        prev_end = 0
+        for m in found:
+            lessons = parse_lesson_set(m.group(3))
+            rm = ROOM_AFTER.match(ln[m.end():])
+            room = rm.group(1).strip() if rm else None
+            if room is None and len(found) == 1:  # кабинет мог стоять перед фамилией
+                before = ROOM_ANY.findall(ln[prev_end:m.start()])
+                room = before[-1] if before else None
+            prev_end = m.end()
+            if lessons and room:
+                out.append({"name": _norm(m.group(1)),
+                            "init": re.sub(r"[^а-яё]", "", _norm(m.group(2))),
+                            "lessons": lessons, "room": room})
+    return out
+
+
+def find_room(teacher, num, rooms):
+    """Кабинет преподавателя на данном уроке (или None)."""
+    parts = teacher.split(None, 1)
+    if not parts:
+        return None
+    name = _norm(parts[0])
+    init = re.sub(r"[^а-яё]", "", _norm(parts[1])) if len(parts) > 1 else ""
+    for r in rooms:
+        if r["name"] != name or num not in r["lessons"]:
+            continue
+        if init and r["init"] and not (init.startswith(r["init"]) or r["init"].startswith(init)):
+            continue  # однофамильцы с другими инициалами
+        return r["room"]
+    return None
+
+
+def fmt_new(d, num, rooms):
+    """Как fmt для новой пары, но с кабинетом из боковой панели, если в таблице он не указан."""
+    teach, auds = uniq(d["nt"]), uniq(d["na"])
+    if auds or not rooms:
+        return fmt(d["ns"], d["nt"], d["na"])
+    found = {t: find_room(t, num, rooms) for t in teach}
+    if not any(found.values()):
+        return fmt(d["ns"], d["nt"], d["na"])
+    if len(teach) == 1:
+        extra = [f"{teach[0]}, ауд. {found[teach[0]]}"]
+    else:
+        extra = [f"{t} — ауд. {found[t]}" if found[t] else t for t in teach]
+    s = " / ".join(uniq(d["ns"]))
+    return f"{s} ({', '.join(extra)})"
+
+
+def lessons_to_lines(lessons, rooms=None):
     rows = []
     for num in sorted(lessons):
         d = lessons[num]
@@ -226,6 +306,7 @@ def lessons_to_lines(lessons):
         new = fmt(d["ns"], d["nt"], d["na"]) or "—"
         if old == new:
             continue  # по факту ничего не изменилось
+        new = fmt_new(d, num, rooms) or "—"  # то же, но с кабинетом из боковой панели
         if rows and rows[-1][1] == (old, new) and rows[-1][0][-1] == num - 1:
             rows[-1][0].append(num)
         else:
@@ -260,6 +341,7 @@ def info_hour(lines):
 def analyze(pdf_bytes: bytes):
     """Возвращает (строки замен | None, инфо-час | None, текст для отладки)."""
     changes, info, debug = None, None, []
+    group_lessons, rooms, side_raw = None, [], []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for n, page in enumerate(pdf.pages, 1):
             lines = page_lines(page)
@@ -274,12 +356,19 @@ def analyze(pdf_bytes: bytes):
             lessons, raw, groups = collect_group(rows, GROUP_CODE)
             debug.append(f"Стр. {n}: строк {len(lines)}, в таблице {len(rows)}, группы: " + ", ".join(groups))
             info = info or info_hour(tails)
-            if raw and changes is None:
-                changes = lessons_to_lines(lessons)
+            rooms += parse_rooms(tails)
+            side_raw += [t for t in tails if "(" in t]
+            if raw and group_lessons is None:
+                group_lessons = lessons
                 debug.append(f"Блок {GROUP_CODE}:\n" + "\n".join(raw))
+    if group_lessons is not None:
+        changes = lessons_to_lines(group_lessons, rooms)
     if changes is None:
         debug.append(f"Группа {GROUP_CODE} в таблице не найдена.")
     debug.append(f"Информационный час: {info or 'нет'}")
+    debug.append("Боковая панель (строки со скобками):\n" + ("\n".join(side_raw) or "—"))
+    debug.append("Кабинеты, которые бот распознал:\n" + (
+        "\n".join(f"{r['name']} {r['init']} уроки {sorted(r['lessons'])} → {r['room']}" for r in rooms) or "—"))
     return changes, info, "\n".join(debug)
 
 
