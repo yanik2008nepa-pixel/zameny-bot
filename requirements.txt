@@ -1,3 +1,3 @@
-python-telegram-bot[webhooks]>=21,<22
-requests
+python-telegram-bot[webhooks,job-queue]
 pdfplumber
+requests
