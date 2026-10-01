@@ -4,6 +4,7 @@
   Замены            - замены на завтра
   Замены 05.10      - замены на конкретную дату (или день недели: Замены пятница)
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
+  Спонсоры          - список спонсоров
   Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
@@ -38,7 +39,7 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"]], resize_keyboard=True, is_persistent=True
+    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["🤝 Спонсоры"]], resize_keyboard=True, is_persistent=True
 )  # кнопки внизу
 
 # Расписание группы по дням недели (0 = понедельник ... 5 = суббота).
@@ -778,6 +779,8 @@ def classify(text):
         return "замены"
     if "уведомлен" in t:
         return "уведомления"
+    if "спонсор" in t:
+        return "спонсоры"
     return "другое"
 
 
@@ -847,6 +850,30 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
 
+# ---------- Спонсоры ----------
+# Чтобы добавить спонсора, допиши ещё один текст в список SPONSORS.
+
+SPONSORS = [
+    "🔋 Замена аккумуляторов на телефонах\n\n"
+    "Телефон садится к обеду, внезапно выключается или греется? "
+    "Скорее всего, дело в аккумуляторе, а не в самом телефоне.\n\n"
+    "Меняю аккумуляторы на iPhone и Android на профессиональном оборудовании. "
+    "Работаю аккуратно, подбираю подходящую батарею под вашу модель, "
+    "после замены проверяю, как телефон держит заряд.\n\n"
+    "✅ iPhone и Android\n"
+    "✅ Профессиональное оборудование\n"
+    "✅ Аккуратная работа без лишних вмешательств\n"
+    "✅ Проверка после замены\n\n"
+    "Вернём телефону нормальную автономию 🔌\n\n"
+    "📩 Писать: @Inkonasik",
+]
+
+
+async def sponsors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "🤝 Спонсоры бота\n\n" + "\n\n———\n\n".join(SPONSORS)
+    await update.message.reply_text(text[:4000], reply_markup=KEYBOARD)
+
+
 # ---------- Болталка ----------
 
 GREET = ["Привет! 👋 Жми кнопку внизу.", "Здарова! Замены или пары?", "О, привет! Что показать?",
@@ -870,6 +897,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "«Замены» — замены на завтра. «Есть ли замены?» — выложены ли они. "
         "«Пары завтра» — расписание с учётом замен.\n"
+        "«🤝 Спонсоры» — наши партнёры.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         "🔔 Я включил уведомления: напишу сам, когда выложат замены, и в 7:00 пришлю расписание на день. "
         "Выключить — кнопка «🔔 Уведомления». Группа " + GROUP_NAME,
@@ -890,6 +918,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🤝\s*)?спонсор"), sponsors))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(замен|debug)"), zameny))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(привет|здаров|здравствуй|хай|ку)\b"), talk(GREET)))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(спасибо|благодарю|спс|сяп)"), talk(THANKS)))
