@@ -6,6 +6,7 @@
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
   Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
   /stats            - статистика (только для ADMIN_IDS)
+  /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
   debug             - как бот разобрал файл (для проверки)
 """
 import asyncio
@@ -826,6 +827,22 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/send текст - рассылка всем подписчикам (только для ADMIN_IDS)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда только для админа.")
+        return
+    parts = re.split(r"\s+", update.message.text.strip(), maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        await update.message.reply_text("Напиши текст после команды, например:\n/send Завтра пары в 9:00", reply_markup=KEYBOARD)
+        return
+    n = len(DATA["subs"])
+    await update.message.reply_text(f"Отправляю {n} подписчикам…")
+    await broadcast(context.bot, f"📢 Сообщение от администратора:\n\n{text}")
+    await update.message.reply_text(f"✅ Готово. Подписчиков сейчас: {len(DATA['subs'])} (из {n}).", reply_markup=KEYBOARD)
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
@@ -869,6 +886,7 @@ def main():
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("send", send_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
