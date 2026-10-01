@@ -271,7 +271,12 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(замен|debug)"), zameny))
-    app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        url_path=BOT_TOKEN,
+        webhook_url=f"{os.environ['RENDER_EXTERNAL_URL']}/{BOT_TOKEN}",
+    )
 
 
 if __name__ == "__main__":
