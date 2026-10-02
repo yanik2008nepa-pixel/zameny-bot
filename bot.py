@@ -9,6 +9,9 @@
   Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
+  /ban id [срок]    - заблокировать пользователя, срок: 30m, 12h, 7d (без срока - навсегда)
+  /unban id         - разблокировать
+  /banlist          - список заблокированных
   debug             - как бот разобрал файл (для проверки)
 """
 import asyncio
@@ -81,6 +84,7 @@ def load_data():
     d.setdefault("subs", [])
     d.setdefault("notified", {})
     d.setdefault("stats", {"users": {}, "days": {}})
+    d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
     for cid in os.environ.get("CHAT_IDS", "").replace(" ", "").split(","):
         if cid.lstrip("-").isdigit() and int(cid) not in d["subs"]:
             d["subs"].append(int(cid))
@@ -375,14 +379,43 @@ def analyze(pdf_bytes: bytes):
     return changes, info, "\n".join(debug)
 
 
+# ---------- Бан (управляет админ) ----------
+
+def is_banned(uid: int) -> bool:
+    ban = DATA["banned"].get(str(uid))
+    if not ban:
+        return False
+    until = ban.get("until", 0)
+    if until and datetime.now().timestamp() >= until:  # срок бана вышел
+        del DATA["banned"][str(uid)]
+        save_data()
+        return False
+    return True
+
+
+def parse_duration(text: str):
+    """'30m' / '12h' / '7d' (можно и м/ч/д) -> секунды, иначе None."""
+    m = re.fullmatch(r"(\d+)\s*([mhdмчд])", text.strip().lower())
+    if not m:
+        return None
+    return int(m.group(1)) * {"m": 60, "м": 60, "h": 3600, "ч": 3600, "d": 86400, "д": 86400}[m.group(2)]
+
+
+def ban_label(uid: str, ban: dict) -> str:
+    name = ban.get("name") or DATA["stats"]["users"].get(uid, {}).get("name") or "без имени"
+    until = ban.get("until", 0)
+    end = f"до {datetime.fromtimestamp(until, TZ):%d.%m %H:%M}" if until else "навсегда"
+    return f"{uid} — {name} ({end})"
+
+
 # ---------- Антиспам ----------
 
-SPAM_COUNT = 4                       # столько сообщений ...
-SPAM_WINDOW = 10                     # ... за столько секунд = спам
+SPAM_LIMIT = 3                       # столько сообщений разрешено ...
+SPAM_WINDOW = 10                     # ... за столько секунд; 4-е сообщение (следующее после лимита) = спам
 SPAM_MUTES = [120, 300, 3600]        # мут по номеру нарушения: 2 мин, 5 мин, 1 час
 SPAM_MUTE_TEXT = ["2 минуты", "5 минут", "1 час"]
 SPAM_FORGET = 6 * 3600               # через сколько без спама счётчик нарушений обнуляется
-_recent = defaultdict(lambda: deque(maxlen=SPAM_COUNT))
+_recent = defaultdict(lambda: deque(maxlen=SPAM_LIMIT + 1))
 _muted_until = {}
 _strikes = {}                        # user_id -> [число нарушений, время конца последнего мута]
 
@@ -489,13 +522,15 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
+    if is_banned(user.id):
+        raise ApplicationHandlerStop  # бан: молча игнорируем всё, в том числе /start
     now = msg.date.timestamp()  # время отправки сообщения, а не обработки: бот обрабатывает по очереди
     if _muted_until.get(user.id, 0) > now:
         track(update)
         raise ApplicationHandlerStop  # игнор, пока действует мут
     q = _recent[user.id]
     q.append(now)
-    if len(q) == SPAM_COUNT and now - q[0] <= SPAM_WINDOW:
+    if len(q) == SPAM_LIMIT + 1 and now - q[0] <= SPAM_WINDOW:
         strike = _strikes.get(user.id, [0, 0])
         if now - strike[1] > SPAM_FORGET:
             strike[0] = 0  # давно не спамил - начинаем сначала
@@ -734,6 +769,9 @@ async def schedule_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if is_banned(q.from_user.id):
+        await q.answer()
+        return
     now = datetime.now().timestamp()
     recent = _cb_recent[q.from_user.id]
     recent.append(now)
@@ -801,6 +839,8 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(bot, text: str):
     for cid in list(DATA["subs"]):
+        if is_banned(cid):  # в личке id чата = id пользователя
+            continue
         try:
             await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
         except (Forbidden, BadRequest):  # бота заблокировали / чата нет
@@ -931,6 +971,60 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Готово. Подписчиков сейчас: {len(DATA['subs'])} (из {n}).", reply_markup=KEYBOARD)
 
 
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ban id [срок] - заблокировать пользователя (только для ADMIN_IDS)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда только для админа.")
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "Напиши id после команды:\n/ban 123456789 — навсегда\n/ban 123456789 24h — на сутки (m — минуты, h — часы, d — дни)\n"
+            "Id людей видно в /stats и /banlist.", reply_markup=KEYBOARD)
+        return
+    uid = int(args[0])
+    if uid in ADMIN_IDS:
+        await update.message.reply_text("Админа банить нельзя.", reply_markup=KEYBOARD)
+        return
+    until = 0
+    if len(args) > 1:
+        secs = parse_duration(args[1])
+        if secs is None:
+            await update.message.reply_text("Не понял срок. Примеры: 30m, 12h, 7d.", reply_markup=KEYBOARD)
+            return
+        until = datetime.now().timestamp() + secs
+    name = DATA["stats"]["users"].get(str(uid), {}).get("name", "")
+    DATA["banned"][str(uid)] = {"name": name, "until": until}
+    save_data()
+    await update.message.reply_text(f"🚫 Заблокирован: {ban_label(str(uid), DATA['banned'][str(uid)])}", reply_markup=KEYBOARD)
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unban id - снять блокировку (только для ADMIN_IDS)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда только для админа.")
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Напиши id после команды: /unban 123456789", reply_markup=KEYBOARD)
+        return
+    if DATA["banned"].pop(args[0], None) is None:
+        await update.message.reply_text("Этого id нет в списке заблокированных.", reply_markup=KEYBOARD)
+        return
+    save_data()
+    await update.message.reply_text(f"✅ Разблокирован: {args[0]}", reply_markup=KEYBOARD)
+
+
+async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/banlist - кто сейчас заблокирован (только для ADMIN_IDS)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда только для админа.")
+        return
+    items = [ban_label(uid, b) for uid, b in list(DATA["banned"].items()) if is_banned(int(uid))]
+    await update.message.reply_text("🚫 Заблокированные:\n" + "\n".join(items) if items else "Заблокированных нет.",
+                                    reply_markup=KEYBOARD)
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
@@ -1001,6 +1095,9 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("send", send_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("banlist", banlist_cmd))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
