@@ -5,7 +5,7 @@
   Замены 05.10      - замены на конкретную дату (или день недели: Замены пятница)
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
   Расписание        - кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
-  Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
+  Уведомления       - настройки: замены вкл/выкл, расписание на день вкл/выкл и своё время (по умолчанию 7:00)
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
   /msg id текст     - личное сообщение одному пользователю (только для ADMIN_IDS)
@@ -90,13 +90,22 @@ FAST_FROM = dtime(8, 0)               # частая проверка с ...
 FAST_TO = dtime(16, 0)                # ... до (не включая)
 ACCESS_REQUIRED = os.environ.get("ACCESS_REQUIRED", "").lower() in ("1", "true", "on", "yes")  # ключ нужен с самого начала
 _last_check = 0.0                     # когда проверяли в последний раз (monotonic)
-MORNING_AT = dtime(7, 0, tzinfo=TZ)   # во сколько присылать утреннее расписание
+MORNING_DEFAULT = "07:00"            # когда присылать расписание на день, если человек не выбрал своё время
+MORNING_GRACE = timedelta(minutes=60)  # если бот проспал нужную минуту, догоняем не позже чем через столько
+
+
+def new_pref(morning: bool, hhmm: str = MORNING_DEFAULT) -> dict:
+    """Настройки расписания на день. Если время сегодня уже прошло, первая отправка будет завтра."""
+    now = datetime.now(TZ)
+    passed = now.time().strftime("%H:%M") >= hhmm
+    return {"morning": morning, "time": hhmm, "last": now.date().isoformat() if passed else ""}
 
 
 def fix_data(d):
     """Добавляет недостающие поля и переносит старые форматы."""
     d.setdefault("subs", [])
     d.setdefault("notified", {})
+    d.setdefault("prefs", {})  # chat_id -> {"morning": вкл/выкл расписание на день, "time": "ЧЧ:ММ", "last": дата последней отправки}
     d.setdefault("stats", {"users": {}, "days": {}})
     d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
     acc = d.setdefault("access", {})
@@ -114,6 +123,8 @@ def fix_data(d):
     for cid in os.environ.get("CHAT_IDS", "").replace(" ", "").split(","):
         if cid.lstrip("-").isdigit() and int(cid) not in d["subs"]:
             d["subs"].append(int(cid))
+    for cid in d["subs"]:  # старые подписчики: расписание на день у них было включено в 7:00
+        d["prefs"].setdefault(str(cid), new_pref(True))
     return d
 
 
@@ -1273,8 +1284,35 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Подписка, уведомления, утреннее расписание ----------
+# Два независимых вида уведомлений:
+#   замены        - DATA["subs"] (пишу, когда выложили/обновили файл с заменами)
+#   расписание    - DATA["prefs"][id] (раз в день в выбранное время, по умолчанию 7:00)
 
-def set_sub(chat_id: int, on: bool):
+def get_pref(chat_id: int) -> dict:
+    p = DATA["prefs"].get(str(chat_id))
+    if p is None:
+        p = DATA["prefs"][str(chat_id)] = new_pref(False)
+    p.setdefault("time", MORNING_DEFAULT)
+    p.setdefault("last", "")
+    return p
+
+
+def parse_hhmm(s):
+    """'7', '7:05', '07.30', '7-30' -> '07:05' или None."""
+    m = re.fullmatch(r"\s*(\d{1,2})(?:\s*[:.\-]\s*(\d{2}))?\s*", s or "")
+    if not m:
+        return None
+    h, mi = int(m[1]), int(m[2] or 0)
+    return f"{h:02d}:{mi:02d}" if h < 24 and mi < 60 else None
+
+
+def _rearm(p: dict):
+    """После включения или смены времени: если время сегодня уже прошло - ждём до завтра, иначе сегодня ещё придёт."""
+    now = datetime.now(TZ)
+    p["last"] = now.date().isoformat() if now.time().strftime("%H:%M") >= p["time"] else ""
+
+
+def set_alerts(chat_id: int, on: bool):
     if on and chat_id not in DATA["subs"]:
         DATA["subs"].append(chat_id)
     elif not on and chat_id in DATA["subs"]:
@@ -1282,21 +1320,165 @@ def set_sub(chat_id: int, on: bool):
     save_data()
 
 
-SUB_ON = ("🔔 Уведомления включены. Я напишу сам, когда выложат замены на завтра "
-          "(или обновят файл), и в 7:00 пришлю расписание на день. Отключить: кнопка «🔔 Уведомления».")
-SUB_OFF = "🔕 Уведомления выключены. Включить обратно: кнопка «🔔 Уведомления»."
+def set_morning(chat_id: int, on: bool):
+    p = get_pref(chat_id)
+    if on and not p["morning"]:
+        _rearm(p)
+    p["morning"] = on
+    save_data()
+
+
+def set_morning_time(chat_id: int, hhmm: str):
+    p = get_pref(chat_id)
+    p["time"] = hhmm
+    _rearm(p)
+    save_data()
+
+
+def set_sub(chat_id: int, on: bool):
+    """Всё сразу: и замены, и расписание на день (время, которое выбрал человек, сохраняется)."""
+    if on:
+        set_morning(chat_id, True)
+    else:
+        set_morning(chat_id, False)
+    set_alerts(chat_id, on)
+
+
+def all_subscribers() -> list:
+    """Все, кому что-то включено (для рассылок админа)."""
+    ids = set(DATA["subs"]) | {int(k) for k, p in DATA["prefs"].items() if p.get("morning") and k.lstrip("-").isdigit()}
+    return sorted(ids)
+
+
+def notif_text(chat_id: int) -> str:
+    alerts, p = chat_id in DATA["subs"], get_pref(chat_id)
+    lines = ["🔔 Настройки уведомлений", "",
+             f"• Замены: {'включены — напишу, когда выложат или обновят файл' if alerts else 'выключены'}",
+             f"• Расписание на день: {'включено — пришлю в ' + p['time'] if p['morning'] else 'выключено'}"]
+    if p["morning"] and p["time"] == MORNING_DEFAULT:
+        lines.append(f"  (время по умолчанию, можно поменять — {MORNING_DEFAULT} уже стоит)")
+    return "\n".join(lines)
+
+
+def notif_markup(chat_id: int) -> InlineKeyboardMarkup:
+    alerts, p = chat_id in DATA["subs"], get_pref(chat_id)
+    rows = [
+        [InlineKeyboardButton(f"{'🔔' if alerts else '🔕'} Замены: {'вкл' if alerts else 'выкл'}", callback_data="ntf:a")],
+        [InlineKeyboardButton(f"{'☀️' if p['morning'] else '🌙'} Расписание на день: {'вкл' if p['morning'] else 'выкл'}",
+                              callback_data="ntf:m")],
+    ]
+    if p["morning"]:
+        rows.append([InlineKeyboardButton(f"⏰ Время расписания: {p['time']}", callback_data="ntf:t")])
+    return InlineKeyboardMarkup(rows)
+
+
+TIME_CHOICES = ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30"]
+
+
+def time_markup(chat_id: int) -> InlineKeyboardMarkup:
+    cur = get_pref(chat_id)["time"]
+    btns = [InlineKeyboardButton(("✅ " if t == cur else "") + t, callback_data="ntf:s:" + t.replace(":", ""))
+            for t in TIME_CHOICES]
+    return InlineKeyboardMarkup([btns[:3], btns[3:],
+                                 [InlineKeyboardButton("✏️ Своё время", callback_data="ntf:c")],
+                                 [InlineKeyboardButton("↩️ Назад", callback_data="ntf:b")]])
+
+
+TIME_TEXT = "⏰ Во сколько присылать расписание на день? Выбери время или нажми «Своё время»."
+AWAIT_TIME = {}  # chat_id -> до какого момента (monotonic) ждём время, написанное текстом
+
+
+class _AwaitTime(filters.MessageFilter):
+    def filter(self, message):
+        return AWAIT_TIME.get(message.chat_id, 0) > time.monotonic()
 
 
 async def toggle_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🔔 Уведомления» - меню настроек."""
     cid = update.effective_chat.id
-    on = cid not in DATA["subs"]
-    set_sub(cid, on)
-    await update.message.reply_text(SUB_ON if on else SUB_OFF, reply_markup=KEYBOARD)
+    AWAIT_TIME.pop(cid, None)
+    await update.message.reply_text(notif_text(cid), reply_markup=notif_markup(cid))
+
+
+async def _edit(q, text, markup):
+    try:
+        await q.edit_message_text(text, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if is_banned(q.from_user.id) or is_muted(q.from_user.id):
+        await q.answer(TECH_TEXT, show_alert=True)
+        return
+    now = datetime.now().timestamp()
+    recent = _cb_recent[q.from_user.id]
+    recent.append(now)
+    if len(recent) == CB_COUNT and now - recent[0] <= CB_WINDOW:
+        await q.answer("Не так быстро 🙂")
+        return
+    cid = q.message.chat_id
+    parts = q.data.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    AWAIT_TIME.pop(cid, None)
+    note = ""
+    if act == "a":
+        on = cid not in DATA["subs"]
+        set_alerts(cid, on)
+        note = "🔔 Уведомления о заменах включены" if on else "🔕 Уведомления о заменах выключены"
+    elif act == "m":
+        on = not get_pref(cid)["morning"]
+        set_morning(cid, on)
+        note = f"☀️ Расписание на день включено — в {get_pref(cid)['time']}" if on else "🌙 Расписание на день выключено"
+    elif act == "t":
+        await q.answer()
+        await _edit(q, TIME_TEXT, time_markup(cid))
+        return
+    elif act == "s" and len(parts) > 2:
+        hhmm = parse_hhmm(parts[2][:2] + ":" + parts[2][2:])
+        if hhmm:
+            set_morning_time(cid, hhmm)
+            note = f"⏰ Расписание на день буду присылать в {hhmm}"
+    elif act == "c":
+        AWAIT_TIME[cid] = time.monotonic() + 600
+        await q.answer()
+        await _edit(q, "✏️ Напиши время сообщением, например: 6:45 или 08.15\n(от 00:00 до 23:59)",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отмена", callback_data="ntf:b")]]))
+        return
+    await q.answer(note or None)
+    await _edit(q, notif_text(cid), notif_markup(cid))
+
+
+async def time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Человек нажал «Своё время» и прислал время текстом."""
+    cid = update.effective_chat.id
+    hhmm = parse_hhmm(update.message.text)
+    if not hhmm:
+        await update.message.reply_text("Не похоже на время 🤔 Напиши, например: 6:45 или 08.15 (от 00:00 до 23:59).")
+        return  # продолжаем ждать
+    AWAIT_TIME.pop(cid, None)
+    set_morning_time(cid, hhmm)
+    p = get_pref(cid)
+    extra = "" if p["morning"] else "\n\nСейчас расписание на день выключено — включи его кнопкой ниже."
+    await update.message.reply_text(f"✅ Время сохранено: {hhmm}.{extra}\n\n" + notif_text(cid),
+                                    reply_markup=notif_markup(cid))
+
+
+def sub_on_text(chat_id: int) -> str:
+    return (f"🔔 Уведомления включены. Я напишу сам, когда выложат замены на завтра (или обновят файл), "
+            f"и в {get_pref(chat_id)['time']} пришлю расписание на день. "
+            "Настроить: кнопка «🔔 Уведомления».")
+
+
+SUB_OFF = "🔕 Уведомления выключены. Включить обратно: кнопка «🔔 Уведомления»."
 
 
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_sub(update.effective_chat.id, True)
-    await update.message.reply_text(SUB_ON, reply_markup=KEYBOARD)
+    cid = update.effective_chat.id
+    set_sub(cid, True)
+    await update.message.reply_text(sub_on_text(cid), reply_markup=KEYBOARD)
 
 
 async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1304,8 +1486,9 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(SUB_OFF, reply_markup=KEYBOARD)
 
 
-async def broadcast(bot, text: str):
-    for cid in list(DATA["subs"]):
+async def broadcast(bot, text: str, ids=None):
+    """Рассылка: по умолчанию тем, у кого включены замены; можно передать свой список id."""
+    for cid in list(DATA["subs"] if ids is None else ids):
         if is_banned(cid) or not has_access(cid):  # в личке id чата = id пользователя
             continue
         try:
@@ -1350,15 +1533,38 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_job(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ).date()
-    if today.weekday() == 6 or not DATA["subs"]:  # в воскресенье занятий нет
+    """Раз в минуту: кому сейчас пора - тому шлём расписание на сегодня (у каждого своё время, по умолчанию 7:00)."""
+    now = datetime.now(TZ)
+    today = now.date()
+    if today.weekday() == 6:  # в воскресенье занятий нет
         return
+    due = []
+    for k, p in DATA["prefs"].items():
+        if not p.get("morning") or p.get("last") == today.isoformat() or not k.lstrip("-").isdigit():
+            continue
+        hhmm = parse_hhmm(p.get("time", MORNING_DEFAULT)) or MORNING_DEFAULT
+        at = datetime.combine(today, dtime(int(hhmm[:2]), int(hhmm[3:])), TZ)
+        if at <= now < at + MORNING_GRACE:
+            due.append((int(k), p, hhmm))
+    if not due:
+        return
+    for _, p, _ in due:  # отмечаем заранее, чтобы не выслать дважды
+        p["last"] = today.isoformat()
+    save_data()
     try:
         text = await asyncio.to_thread(make_schedule_reply, today)
     except Exception:  # noqa: BLE001
         log.exception("ошибка утреннего расписания")
+        for _, p, _ in due:  # попробуем в следующую минуту
+            p["last"] = ""
+        save_data()
         return
-    await broadcast(context.bot, f"☀️ Доброе утро!\n\n{text}")
+    morning = [cid for cid, _, hhmm in due if hhmm < "12:00"]
+    later = [cid for cid, _, hhmm in due if hhmm >= "12:00"]
+    if morning:
+        await broadcast(context.bot, f"☀️ Доброе утро!\n\n{text}", ids=morning)
+    if later:
+        await broadcast(context.bot, f"📅 Расписание на сегодня\n\n{text}", ids=later)
 
 
 # ---------- Статистика ----------
@@ -1423,7 +1629,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
         f"За 7 дней сообщений: {sum(x.get('msgs', 0) for x in week)}",
         f"Всего людей писало: {len(st['users'])}",
-        f"Подписчиков на уведомления: {len(DATA['subs'])}",
+        f"Уведомления о заменах: {len(DATA['subs'])} чел., расписание на день: "
+        f"{sum(1 for p in DATA['prefs'].values() if p.get('morning'))} чел.",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -1438,10 +1645,10 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Напиши текст после команды, например:\n/send Завтра пары в 9:00", reply_markup=KEYBOARD)
         return
-    n = len(DATA["subs"])
+    n = len(all_subscribers())
     await update.message.reply_text(f"Отправляю {n} подписчикам…")
-    await broadcast(context.bot, f"📢 Сообщение от администратора:\n\n{text}")
-    await update.message.reply_text(f"✅ Готово. Подписчиков сейчас: {len(DATA['subs'])} (из {n}).", reply_markup=KEYBOARD)
+    await broadcast(context.bot, f"📢 Сообщение от администратора:\n\n{text}", ids=all_subscribers())
+    await update.message.reply_text(f"✅ Готово. Подписчиков сейчас: {len(all_subscribers())} (из {n}).", reply_markup=KEYBOARD)
 
 
 async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1852,8 +2059,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«Пары завтра» — расписание с учётом замен.\n"
         "«📅 Расписание» — расписание на любой день недели (Пн–Сб), там же можно глянуть замены.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
-        "🔔 Я включил уведомления: напишу сам, когда выложат замены, и в 7:00 пришлю расписание на день. "
-        "Выключить — кнопка «🔔 Уведомления». Группа " + GROUP_NAME + start_note(update.effective_user.id),
+        f"🔔 Я включил уведомления: напишу сам, когда выложат замены, и в {get_pref(update.effective_chat.id)['time']} "
+        "пришлю расписание на день. Настроить (замены, расписание, время) — кнопка «🔔 Уведомления». "
+        "Группа " + GROUP_NAME + start_note(update.effective_user.id),
         reply_markup=KEYBOARD,
     )
 
@@ -1903,7 +2111,9 @@ def main():
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
+    app.add_handler(CallbackQueryHandler(notif_cb, pattern=r"^ntf:"))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
+    app.add_handler(MessageHandler(filters.Regex(r"^\s*\d{1,2}(\s*[:.\-]\s*\d{2})?\s*$") & _AwaitTime(), time_input))  # время текстом
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(📅\s*)?расписан"), schedule_button))
@@ -1918,7 +2128,7 @@ def main():
         log.warning("JobQueue недоступен: установите python-telegram-bot[job-queue,webhooks]")
     else:
         app.job_queue.run_repeating(watch_job, interval=CHECK_FAST, first=30)
-        app.job_queue.run_daily(morning_job, time=MORNING_AT)
+        app.job_queue.run_repeating(morning_job, interval=60, first=20)  # расписание на день, у каждого своё время
         app.job_queue.run_repeating(access_job, interval=60, first=45)          # конец доступа по ключу
         app.job_queue.run_daily(backup_job, time=dtime(3, 0, tzinfo=TZ))        # копия данных админам
     app.run_webhook(
