@@ -521,7 +521,7 @@ SPAM_REPLIES = [
 # ---------- Уведомление «тех. работы» для тех, кто в муте или в бане ----------
 
 TECH_TEXT = "⚠️ Ошибка либо бот отключён на проведение тех. работ.\nПовторите попытку позже."
-NOTICE_EVERY = 60  # не чаще одного такого ответа в минуту, чтобы бот сам не спамил в ответ
+NOTICE_EVERY = 5  # не чаще одного такого ответа в 5 секунд, чтобы бот сам не спамил в ответ
 _last_notice = {}
 
 
@@ -536,8 +536,9 @@ async def blocked_notice(msg, uid: int):
     _last_notice[uid] = now
     try:
         await msg.reply_text(TECH_TEXT)
-    except Exception:  # noqa: BLE001
-        pass
+        log.info("уведомление «тех. работы» отправлено пользователю %s", uid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("не удалось отправить уведомление «тех. работы» пользователю %s: %r", uid, e)
 
 
 # ---------- Конец мута и амнистия ----------
@@ -627,7 +628,6 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _strikes[user.id] = strike
         q.clear()
         track(update, spam=True)
-        _last_notice[user.id] = datetime.now().timestamp()  # «тех. работы» появятся не сразу после ругани
         if context.job_queue:  # уведомим, когда мут закончится и когда пройдёт амнистия
             until, now_real = _muted_until[user.id], datetime.now().timestamp()
             context.job_queue.run_once(unmute_job, max(1, until - now_real),
