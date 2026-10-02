@@ -12,6 +12,13 @@
   /ban id [срок]    - заблокировать пользователя, срок: 30m, 12h, 7d (без срока - навсегда)
   /unban id         - разблокировать
   /banlist          - список заблокированных
+  /admin            - панель админа с кнопками (создать ключ, список, вкл/выкл проверки) (только для ADMIN_IDS)
+  /key [срок] [кол-во] - создать одноразовый ключ: /key, /key 7d, /key 30d 10 (только для ADMIN_IDS)
+  /keys, /users     - список ключей / у кого есть доступ
+  /delkey КЛЮЧ      - удалить ключ;  /revoke id - забрать доступ у человека
+  /access on|off    - включить/выключить проверку ключа (on all - сбросить доступ даже у тех, кто вводил ключ)
+  /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
+  /mykey            - свой статус доступа
   debug             - как бот разобрал файл (для проверки)
 """
 import asyncio
@@ -21,6 +28,9 @@ import logging
 import os
 import random
 import re
+import secrets
+import threading
+import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
@@ -28,10 +38,11 @@ from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+                      Update)
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+                          ContextTypes, MessageHandler, TypeHandler, filters)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
@@ -64,44 +75,133 @@ SCHEDULE = {
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("zameny")
 
-# ---------- Данные (подписчики, статистика) ----------
-# Хранятся в JSON-файле. На бесплатном Render диск стирается при перезапуске,
-# поэтому подписчиков можно продублировать в переменной CHAT_IDS (id через запятую).
+# ---------- Данные (подписчики, статистика, ключи) ----------
+# Хранятся в JSON-файле. На бесплатном Render диск стирается при перезапуске, поэтому
+# данные дополнительно (и автоматически) дублируются в приватный GitHub Gist, если заданы
+# переменные GITHUB_TOKEN и GIST_ID. Подписчиков можно продублировать и в CHAT_IDS (id через запятую).
 
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
              if x.lstrip("-").isdigit()}
-CHECK_EVERY = 300                     # как часто проверять Яндекс Диск (сек)
+CHECK_FAST = 60                       # частая проверка (сек): пн-сб в рабочие часы
+CHECK_SLOW = 300                      # обычная проверка (сек): в остальное время
+FAST_FROM = dtime(8, 0)               # частая проверка с ...
+FAST_TO = dtime(16, 0)                # ... до (не включая)
+ACCESS_REQUIRED = os.environ.get("ACCESS_REQUIRED", "").lower() in ("1", "true", "on", "yes")  # ключ нужен с самого начала
+_last_check = 0.0                     # когда проверяли в последний раз (monotonic)
 MORNING_AT = dtime(7, 0, tzinfo=TZ)   # во сколько присылать утреннее расписание
 
 
-def load_data():
-    try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError):
-        d = {}
+def fix_data(d):
+    """Добавляет недостающие поля и переносит старые форматы."""
     d.setdefault("subs", [])
     d.setdefault("notified", {})
     d.setdefault("stats", {"users": {}, "days": {}})
     d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
+    acc = d.setdefault("access", {})
+    acc.setdefault("required", ACCESS_REQUIRED)  # нужен ли ключ доступа
+    acc.setdefault("allowed", {})                # id -> {"until": конец доступа (0 = навсегда), "granted", "warned"}
+    acc.setdefault("keys", {})                   # ключ -> {created, dur, max_uses, uses, users}
+    if isinstance(acc["allowed"], list):         # старый формат: просто список id
+        acc["allowed"] = {str(u): {"until": 0, "granted": 0, "warned": False} for u in acc["allowed"]}
+    for k in acc["keys"].values():
+        k.setdefault("dur", 0)
+    for uid in os.environ.get("ACCESS_IDS", "").replace(" ", "").split(","):  # запасной список (диск мог стереться)
+        if uid.lstrip("-").isdigit():
+            acc["allowed"].setdefault(str(int(uid)), {"until": 0, "granted": 0, "warned": False})
     for cid in os.environ.get("CHAT_IDS", "").replace(" ", "").split(","):
         if cid.lstrip("-").isdigit() and int(cid) not in d["subs"]:
             d["subs"].append(int(cid))
     return d
 
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_FILE = "bot_data.json"
+GIST_URL = f"https://api.github.com/gists/{GIST_ID}"
+GIST_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+_gist_ready = False                  # True, если Gist удалось прочитать (только тогда в него пишем)
+_gist_text = [None]                  # последний снимок данных для отправки
+_gist_event = threading.Event()
+_gist_thread = None
+
+
+def gist_load():
+    """Данные из Gist: dict ({} если файл пуст) или None, если прочитать не вышло (тогда Gist не трогаем)."""
+    if not (GITHUB_TOKEN and GIST_ID):
+        return None
+    for _ in range(3):
+        try:
+            r = requests.get(GIST_URL, headers=GIST_HEADERS, timeout=15)
+            r.raise_for_status()
+            f = r.json().get("files", {}).get(GIST_FILE)
+            if not f:
+                return {}
+            text = f.get("content") or ""
+            if f.get("truncated"):
+                text = requests.get(f["raw_url"], headers=GIST_HEADERS, timeout=15).text
+            d = json.loads(text) if text.strip() else {}
+            if isinstance(d, dict):
+                return d
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось прочитать Gist")
+        time.sleep(2)
+    return None
+
+
+def _gist_worker():
+    while True:
+        _gist_event.wait()
+        time.sleep(2)            # собираем частые изменения в одну отправку
+        _gist_event.clear()
+        try:
+            r = requests.patch(GIST_URL, headers=GIST_HEADERS, timeout=20,
+                               json={"files": {GIST_FILE: {"content": _gist_text[0]}}})
+            r.raise_for_status()
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось сохранить копию в Gist, повторю позже")
+            _gist_event.set()
+            time.sleep(30)
+
+
+def load_data():
+    global _gist_ready
+    d = gist_load()
+    if d is not None:
+        _gist_ready = True
+        log.info("Данные читаю из Gist, автосохранение в Gist включено")
+    if not d:
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            d = {}
+    if not (GITHUB_TOKEN and GIST_ID):
+        log.warning("GITHUB_TOKEN/GIST_ID не заданы: данные только на диске, Render их может стереть")
+    elif not _gist_ready:
+        log.error("Gist не прочитался: копию в него не пишу, чтобы не затереть старые данные")
+    return fix_data(d)
+
+
 DATA = load_data()
 
 
 def save_data():
+    global _gist_thread
     try:
+        text = json.dumps(DATA, ensure_ascii=False)
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(DATA, f, ensure_ascii=False)
+            f.write(text)
         os.replace(tmp, DATA_FILE)
     except OSError:
         log.exception("не получилось сохранить данные")
+    if _gist_ready:
+        _gist_text[0] = text
+        _gist_event.set()
+        if _gist_thread is None or not _gist_thread.is_alive():
+            _gist_thread = threading.Thread(target=_gist_worker, daemon=True)
+            _gist_thread.start()
 
 
 
@@ -408,6 +508,223 @@ def ban_label(uid: str, ban: dict) -> str:
     return f"{uid} — {name} ({end})"
 
 
+# ---------- Ключи доступа ----------
+# Ключ даёт доступ навсегда (dur = 0) или на время (dur = секунд с момента ввода ключа).
+# Админы (ADMIN_IDS) проходят без ключа. Пока проверка выключена (/access off), бот открыт для всех.
+
+KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих символов (0/O, 1/I)
+WARN_MAX = 24 * 3600                               # предупреждать о конце доступа не раньше чем за сутки
+ADMIN_CONTACT = os.environ.get("ADMIN_CONTACT", "").strip()  # например @username - покажем тем, у кого нет ключа
+
+
+def norm_key(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def fmt_key(key: str) -> str:
+    return f"{key[:4]}-{key[4:]}"
+
+
+def dur_label(secs: int) -> str:
+    if not secs:
+        return "навсегда"
+    if secs % 86400 == 0:
+        return f"{secs // 86400} дн."
+    if secs >= 3600:
+        return f"{secs // 3600} ч"
+    return f"{max(1, secs // 60)} мин"
+
+
+def until_label(until: float) -> str:
+    return "навсегда" if not until else f"до {datetime.fromtimestamp(until, TZ):%d.%m.%Y %H:%M}"
+
+
+def parse_term(text: str):
+    """'7d' / '12h' / '30m' -> секунды; 'навсегда' / '0' -> 0; непонятное -> None."""
+    t = text.strip().lower()
+    if t in ("0", "forever", "навсегда", "inf", "∞"):
+        return 0
+    return parse_duration(t)
+
+
+def grant(uid: int, dur: int):
+    """Выдаёт доступ на dur секунд (0 = навсегда). Если доступ уже есть - продлевает."""
+    allowed, now = DATA["access"]["allowed"], time.time()
+    cur = allowed.get(str(uid))
+    live = bool(cur) and (not cur["until"] or cur["until"] > now)
+    if not dur or (live and not cur["until"]):
+        until = 0
+    else:
+        until = (cur["until"] if live else now) + dur
+    allowed[str(uid)] = {"until": until, "granted": now, "warned": False}
+
+
+def has_access(uid: int) -> bool:
+    acc = DATA["access"]
+    if not acc["required"] or uid in ADMIN_IDS:
+        return True
+    a = acc["allowed"].get(str(uid))
+    return bool(a) and (not a["until"] or time.time() < a["until"])
+
+
+def key_state(k: dict) -> str:
+    return "used" if k["uses"] >= k["max_uses"] else "ok"
+
+
+def redeem_key(uid: int, raw: str) -> str:
+    """Применяет ключ. Возвращает 'ok' / 'invalid' / 'used'."""
+    k = DATA["access"]["keys"].get(norm_key(raw))
+    if not k:
+        return "invalid"
+    if key_state(k) == "used":
+        return "used"
+    k["uses"] += 1
+    k["users"].append(uid)
+    grant(uid, k["dur"])
+    save_data()
+    return "ok"
+
+
+def create_key(uses: int, dur: int) -> str:
+    keys = DATA["access"]["keys"]
+    while True:
+        key = "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
+        if key not in keys:
+            break
+    keys[key] = {"created": time.time(), "dur": dur, "max_uses": uses, "uses": 0, "users": []}
+    save_data()
+    return key
+
+
+def set_access(on: bool, strict: bool = False) -> str:
+    """Включает/выключает проверку ключа, возвращает текст для админа."""
+    acc = DATA["access"]
+    if not on:
+        acc["required"] = False
+        save_data()
+        return "🔓 Проверка ключа выключена: бот открыт для всех."
+    if strict:
+        n = len(acc["allowed"])
+        acc["allowed"] = {}
+        text = f"🔒 Проверка ключа включена. Доступ сброшен и у тех, кто вводил ключ ({n}): ключ нужен каждому, кроме админов."
+    else:
+        # доступ сохраняется только у тех, кто вводил ключ (и у админов); остальным ключ нужен
+        known = set(DATA["subs"]) | {int(u) for u in DATA["stats"]["users"] if u.lstrip("-").isdigit()}
+        without = [u for u in known if u not in ADMIN_IDS and str(u) not in acc["allowed"]]
+        text = (f"🔒 Проверка ключа включена. У кого уже есть ключ ({len(acc['allowed'])}) и у админов доступ остаётся. "
+                f"Без ключа остались {len(without)} чел., кто раньше пользовался ботом: им нужен ключ.")
+    acc["required"] = True
+    save_data()
+    return text
+
+
+KEY_ERRORS = {
+    "invalid": "❌ Неверный ключ. Проверь и отправь ещё раз.",
+    "used": "❌ Этот ключ уже использован. Попроси новый у администратора.",
+    "forever": "✅ У тебя уже доступ навсегда, ключ тратить не нужно. Он остаётся действующим.",
+    "locked": "⏳ Слишком много неверных ключей. Подожди 15 минут и попробуй снова.",
+}
+FAIL_LIMIT, FAIL_WINDOW, FAIL_LOCK = 5, 600, 900   # 5 неверных ключей за 10 минут -> пауза 15 минут
+_key_fails = {}                                    # user_id -> [число ошибок, начало окна, пауза до]
+
+
+def try_key(uid: int, raw: str) -> str:
+    """Применяет ключ с защитой от перебора. Возвращает 'ok' / 'invalid' / 'used' / 'forever' / 'locked'."""
+    now = time.time()
+    f = _key_fails.get(uid)
+    if f and f[2] > now:
+        return "locked"
+    a = DATA["access"]["allowed"].get(str(uid))
+    if a and not a["until"] and DATA["access"]["keys"].get(norm_key(raw)):
+        return "forever"  # доступ уже вечный: ключ не расходуем
+    res = redeem_key(uid, raw)
+    if res == "invalid":
+        if not f or now - f[1] > FAIL_WINDOW:
+            f = [0, now, 0]
+        f[0] += 1
+        if f[0] >= FAIL_LIMIT:
+            f = [0, now, now + FAIL_LOCK]
+        _key_fails[uid] = f
+    elif res == "ok":
+        _key_fails.pop(uid, None)
+    return res
+
+
+def lock_text(note: str = "") -> str:
+    who = f"Ключ выдаёт администратор: {ADMIN_CONTACT}" if ADMIN_CONTACT else "Ключ выдаёт администратор."
+    return f"{note}🔒 Доступ к боту по ключу.\n\nОтправь ключ сообщением (вид XXXX-XXXX).\n{who}"
+
+
+async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пока включена проверка, без ключа бот ничего не делает (кроме приёма самого ключа)."""
+    user = update.effective_user
+    if not user:
+        return
+    acc, uid, msg = DATA["access"], user.id, update.message
+    if has_access(uid):
+        # продление: человек с доступом прислал новый ключ
+        if acc["required"] and uid not in ADMIN_IDS and msg and msg.text:
+            raw = msg.text.strip()
+            if len(raw) <= 20 and len(norm_key(raw)) == 8 and norm_key(raw) in acc["keys"]:
+                res = try_key(uid, raw)
+                if res == "ok":
+                    await msg.reply_text(f"✅ Ключ принят. Доступ: {until_label(acc['allowed'][str(uid)]['until'])}.")
+                else:
+                    await msg.reply_text(KEY_ERRORS[res])
+                raise ApplicationHandlerStop
+        return
+    if update.callback_query:
+        await update.callback_query.answer("🔒 Нужен ключ доступа. Отправь его боту сообщением.", show_alert=True)
+        raise ApplicationHandlerStop
+    if not msg:
+        return
+    text = (msg.text or "").strip()
+    if re.match(r"(?i)^/myid\b", text):
+        return  # чтобы можно было узнать свой id
+    m = re.match(r"(?i)^/start(?:@\w+)?\s+(.+)$", text)  # ссылка вида t.me/бот?start=КЛЮЧ
+    candidate = m.group(1) if m else ("" if text.startswith("/") else text)
+    if candidate and len(candidate) <= 40 and len(norm_key(candidate)) == 8:  # похоже на ключ
+        res = try_key(uid, candidate)
+        if res == "ok":
+            await msg.reply_text(f"✅ Ключ принят! Доступ: {until_label(acc['allowed'][str(uid)]['until'])}.")
+            await start(update, context)
+        else:
+            await msg.reply_text(KEY_ERRORS[res])
+        raise ApplicationHandlerStop
+    expired = str(uid) in acc["allowed"]  # запись есть, а доступа нет - значит срок вышел
+    await msg.reply_text(lock_text("⌛ Срок твоего доступа закончился.\n\n" if expired else ""),
+                         reply_markup=ReplyKeyboardRemove())
+    raise ApplicationHandlerStop
+
+
+async def access_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в минуту: предупреждает о скором конце доступа и сообщает, когда он закончился."""
+    acc = DATA["access"]
+    if not acc["required"]:
+        return
+    now, changed = time.time(), False
+    for uid_s, a in list(acc["allowed"].items()):
+        until = a.get("until", 0)
+        if not until:
+            continue
+        uid = int(uid_s)
+        if now >= until:
+            del acc["allowed"][uid_s]
+            changed = True
+            set_sub(uid, False)  # без доступа рассылки не нужны; при новом ключе /start включит снова
+            await _safe_send(context.bot, uid,
+                             "⌛ Срок твоего доступа закончился.\n\nЧтобы продолжить пользоваться ботом, "
+                             "отправь новый ключ (его выдаёт администратор).", ReplyKeyboardRemove())
+        elif not a.get("warned") and until - now <= min(WARN_MAX, max(60, (until - a.get("granted", now)) / 4)):
+            a["warned"] = True
+            changed = True
+            await _safe_send(context.bot, uid,
+                             f"⏳ Твой доступ заканчивается {until_label(until)}.\n\n"
+                             "Чтобы продлить, просто отправь боту новый ключ сообщением.")
+    if changed:
+        save_data()
+
+
 # ---------- Антиспам ----------
 
 SPAM_LIMIT = 3                       # столько сообщений разрешено ...
@@ -577,9 +894,9 @@ AMNESTY_REPLIES = [
 ]
 
 
-async def _safe_send(bot, chat_id, text: str):
+async def _safe_send(bot, chat_id, text: str, reply_markup=None):
     try:
-        await bot.send_message(chat_id, text)
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
     except (Forbidden, BadRequest):  # человек заблокировал бота
         pass
     except Exception:  # noqa: BLE001
@@ -933,7 +1250,7 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(bot, text: str):
     for cid in list(DATA["subs"]):
-        if is_banned(cid):  # в личке id чата = id пользователя
+        if is_banned(cid) or not has_access(cid):  # в личке id чата = id пользователя
             continue
         try:
             await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
@@ -945,7 +1262,15 @@ async def broadcast(bot, text: str):
 
 
 async def watch_job(context: ContextTypes.DEFAULT_TYPE):
-    """Раз в CHECK_EVERY секунд смотрит, не появился ли/не изменился ли файл на завтра."""
+    """Смотрит, не появился ли/не изменился ли файл на завтра.
+    Пн-сб с 8:00 до 16:00 - каждую минуту, в остальное время - раз в 5 минут."""
+    global _last_check
+    now = datetime.now(TZ)
+    fast = now.weekday() < 6 and FAST_FROM <= now.time() < FAST_TO
+    gap = CHECK_FAST if fast else CHECK_SLOW
+    if time.monotonic() - _last_check < gap - 5:  # -5 сек запас на дрожание таймера
+        return
+    _last_check = time.monotonic()
     if not DATA["subs"]:
         return
     day = next_workday(datetime.now(TZ).date())
@@ -1144,6 +1469,259 @@ async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=KEYBOARD)
 
 
+def _admin_only(update: Update) -> bool:
+    return update.effective_user.id in ADMIN_IDS
+
+
+NOT_ADMIN = "Эта команда только для админа."
+
+
+def key_card(key: str) -> str:
+    k = DATA["access"]["keys"][key]
+    note = "" if DATA["access"]["required"] else "\n\n⚠️ Проверка ключа сейчас выключена. Включить: /access on"
+    return f"🔑 Ключ: `{fmt_key(key)}`\nДоступ: {dur_label(k['dur'])}\nОдноразовый: подходит для одной активации{note}"
+
+
+def keys_text() -> str:
+    acc = DATA["access"]
+    lines = [f"Проверка ключа: {'включена' if acc['required'] else 'выключена'}. Людей с доступом: {len(acc['allowed'])}", ""]
+    for key, k in sorted(acc["keys"].items(), key=lambda kv: -kv[1]["created"]):
+        mark = "☑️" if key_state(k) == "used" else "✅"
+        who = f", ввёл {k['users'][0]}" if k["users"] else ""
+        lines.append(f"{mark} {fmt_key(key)} — доступ {dur_label(k['dur'])}{who}")
+    if not acc["keys"]:
+        lines.append("Ключей нет. Создать: /key или /admin")
+    return "\n".join(lines)[:4000]
+
+
+def users_text() -> str:
+    acc, names = DATA["access"], DATA["stats"]["users"]
+    if not acc["allowed"]:
+        return "Ни у кого нет сохранённого доступа. Админы проходят без ключа."
+    rows = sorted(acc["allowed"].items(), key=lambda kv: (kv[1]["until"] == 0, kv[1]["until"]))
+    lines = [f"👥 С доступом: {len(rows)}"]
+    for uid, a in rows:
+        lines.append(f"{uid} — {names.get(uid, {}).get('name') or 'без имени'} ({until_label(a['until'])})")
+    return "\n".join(lines)[:4000]
+
+
+async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/key [кол-во] [срок] - создать ключ доступа (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    args = context.args or []
+    dur, count = 0, 1
+    if args:
+        dur = parse_term(args[0])
+        if dur is None:
+            await update.message.reply_text(
+                "Формат: /key [срок доступа] [сколько ключей]\n\n"
+                "/key — один ключ, доступ навсегда\n/key 7d — один ключ, доступ 7 дней\n"
+                "/key 30d 10 — десять ключей, каждый даёт 30 дней\n/key навсегда 5 — пять ключей, навсегда\n\n"
+                "Срок: m — минуты, h — часы, d — дни. Он считается с момента, когда человек ввёл ключ. "
+                "Каждый ключ одноразовый. Или нажми /admin — там кнопки.", reply_markup=KEYBOARD)
+            return
+    if len(args) > 1:
+        if not args[1].isdigit() or not 1 <= int(args[1]) <= 30:
+            await update.message.reply_text("Сколько ключей — число от 1 до 30.", reply_markup=KEYBOARD)
+            return
+        count = int(args[1])
+    if count == 1:
+        await update.message.reply_text(key_card(create_key(1, dur)), parse_mode="Markdown", reply_markup=KEYBOARD)
+        return
+    keys = [create_key(1, dur) for _ in range(count)]
+    note = "" if DATA["access"]["required"] else "\n\n⚠️ Проверка ключа сейчас выключена. Включить: /access on"
+    await update.message.reply_text(
+        f"🔑 Ключей: {count}, доступ по каждому: {dur_label(dur)}. Каждый одноразовый.\n\n"
+        + "\n".join(f"`{fmt_key(k)}`" for k in keys) + note, parse_mode="Markdown", reply_markup=KEYBOARD)
+
+
+async def keys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/keys - список ключей (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    await update.message.reply_text(keys_text(), reply_markup=KEYBOARD)
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/users - у кого есть доступ и до какого времени (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    await update.message.reply_text(users_text(), reply_markup=KEYBOARD)
+
+
+async def delkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delkey КЛЮЧ - удалить ключ (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Напиши ключ: /delkey ABCD-1234", reply_markup=KEYBOARD)
+        return
+    if DATA["access"]["keys"].pop(norm_key(" ".join(args)), None) is None:
+        await update.message.reply_text("Такого ключа нет. Список: /keys", reply_markup=KEYBOARD)
+        return
+    save_data()
+    await update.message.reply_text("🗑 Ключ удалён. Кто уже ввёл его, доступ сохраняет (забрать: /revoke id).",
+                                    reply_markup=KEYBOARD)
+
+
+async def access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/access on|off - включить/выключить проверку ключа (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if not args or args[0] not in ("on", "off", "вкл", "выкл"):
+        await update.message.reply_text(
+            f"Проверка ключа сейчас: {'включена' if DATA['access']['required'] else 'выключена'}.\n\n"
+            "/access on — включить (у кого уже есть ключ, не спросит; кто пользовался без ключа, тому ключ нужен)\n"
+            "/access on all — включить и сбросить доступ вообще у всех, даже у тех, кто вводил ключ (кроме админов)\n"
+            "/access off — выключить, бот открыт для всех", reply_markup=KEYBOARD)
+        return
+    on = args[0] in ("on", "вкл")
+    strict = len(args) > 1 and args[1] in ("all", "все", "всех")
+    await update.message.reply_text(set_access(on, strict), reply_markup=KEYBOARD)
+
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/revoke id - забрать доступ у пользователя (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Напиши id: /revoke 123456789", reply_markup=KEYBOARD)
+        return
+    if DATA["access"]["allowed"].pop(str(int(args[0])), None) is None:
+        await update.message.reply_text("У этого id нет сохранённого доступа. Список: /users", reply_markup=KEYBOARD)
+        return
+    set_sub(int(args[0]), False)
+    await update.message.reply_text(f"🚫 Доступ у {args[0]} забран (если проверка ключа включена, ему снова нужен ключ).",
+                                    reply_markup=KEYBOARD)
+
+
+async def mykey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mykey - свой статус доступа."""
+    uid, acc = update.effective_user.id, DATA["access"]
+    if uid in ADMIN_IDS:
+        text = "👑 Ты админ: ключ тебе не нужен."
+    elif not acc["required"]:
+        text = "Проверка ключа сейчас выключена, бот открыт для всех."
+    else:
+        text = f"🔑 Твой доступ: {until_label(acc['allowed'][str(uid)]['until'])}.\nПродлить: отправь боту новый ключ."
+    await update.message.reply_text(text, reply_markup=KEYBOARD)
+
+
+# ---------- Панель админа (кнопки) ----------
+
+def admin_markup() -> InlineKeyboardMarkup:
+    on, B = DATA["access"]["required"], InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [B("🔑 На 1 день", callback_data="adm:key:1d"), B("🔑 На 7 дней", callback_data="adm:key:7d")],
+        [B("🔑 На 30 дней", callback_data="adm:key:30d"), B("🔑 Навсегда", callback_data="adm:key:0")],
+        [B("📋 Ключи", callback_data="adm:keys"), B("👥 Люди", callback_data="adm:users")],
+        [B("🔓 Выключить проверку ключа" if on else "🔒 Включить проверку ключа", callback_data="adm:toggle")],
+    ])
+
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin - панель с кнопками (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    on = DATA["access"]["required"]
+    await update.message.reply_text(
+        f"🛠 Панель администратора\nПроверка ключа: {'включена 🔒' if on else 'выключена 🔓'}\n"
+        f"Сохранение данных: {'авто в GitHub Gist ✅' if _gist_ready else 'только диск ⚠️ (Render может стереть)'}\n\n"
+        "Кнопки «🔑» создают одноразовый ключ. Сразу несколько: /key 7d 10",
+        reply_markup=admin_markup())
+
+
+async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:  # кнопки видит только админ, но проверяем и здесь
+        await q.answer("Только для админа", show_alert=True)
+        return
+    await q.answer()
+    action, chat_id = q.data.split(":", 1)[1], q.message.chat_id
+    if action.startswith("key:"):
+        dur = parse_term(action[4:])
+        if dur is not None:
+            await context.bot.send_message(chat_id, key_card(create_key(1, dur)), parse_mode="Markdown")
+    elif action == "keys":
+        await context.bot.send_message(chat_id, keys_text())
+    elif action == "users":
+        await context.bot.send_message(chat_id, users_text())
+    elif action == "toggle":
+        text = set_access(not DATA["access"]["required"])
+        try:
+            await q.message.edit_reply_markup(reply_markup=admin_markup())
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id, text)
+
+
+# ---------- Резервная копия данных ----------
+# На бесплатном Render диск стирается при перезапуске: копия в Telegram позволяет вернуть ключи и подписчиков.
+
+BACKUP_CAPTION = "💾 Резервная копия данных бота. Восстановить: отправь этот файл боту с подписью /restore"
+
+
+async def send_backup(bot, chat_id):
+    save_data()
+    bio = io.BytesIO(json.dumps(DATA, ensure_ascii=False, indent=1).encode("utf-8"))
+    name = f"bot_data_{datetime.now(TZ):%Y-%m-%d_%H%M}.json"
+    await bot.send_document(chat_id, bio, filename=name, caption=BACKUP_CAPTION)
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backup - прислать файл с данными (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    await send_backup(context.bot, update.effective_chat.id)
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    for admin in ADMIN_IDS:
+        try:
+            await send_backup(context.bot, admin)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить резервную копию %s", admin)
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Файл резервной копии с подписью /restore - вернуть данные (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    doc = update.message.document
+    if doc.file_size and doc.file_size > 5_000_000:
+        await update.message.reply_text("Файл слишком большой для копии бота.", reply_markup=KEYBOARD)
+        return
+    try:
+        raw = bytes(await (await doc.get_file()).download_as_bytearray())
+        new = json.loads(raw.decode("utf-8"))
+        if not isinstance(new, dict) or not ({"subs", "access", "stats"} & set(new)):
+            raise ValueError("не похоже на копию бота")
+    except Exception:  # noqa: BLE001
+        await update.message.reply_text("❌ Не получилось прочитать файл. Нужен файл, который прислал сам бот (/backup).",
+                                        reply_markup=KEYBOARD)
+        return
+    fix_data(new)
+    DATA.clear()
+    DATA.update(new)
+    save_data()
+    await update.message.reply_text(
+        f"✅ Данные восстановлены.\nПодписчиков: {len(DATA['subs'])}, людей с доступом: {len(DATA['access']['allowed'])}, "
+        f"ключей: {len(DATA['access']['keys'])}.", reply_markup=KEYBOARD)
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
@@ -1166,6 +1744,17 @@ def talk(options):
     return handler
 
 
+def start_note(uid: int) -> str:
+    """Приписка к приветствию: до какого времени доступ (или подсказка админу)."""
+    acc = DATA["access"]
+    if uid in ADMIN_IDS:
+        return "\n\n🛠 Админ: /admin — панель ключей, /key — создать ключ."
+    a = acc["allowed"].get(str(uid))
+    if acc["required"] and a and a["until"]:
+        return f"\n\n🔑 Доступ {until_label(a['until'])}. Продлить: отправь боту новый ключ."
+    return ""
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_sub(update.effective_chat.id, True)
     await update.message.reply_text(
@@ -1174,15 +1763,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«📅 Расписание» — расписание на любой день недели (Пн–Сб), там же можно глянуть замены.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         "🔔 Я включил уведомления: напишу сам, когда выложат замены, и в 7:00 пришлю расписание на день. "
-        "Выключить — кнопка «🔔 Уведомления». Группа " + GROUP_NAME,
+        "Выключить — кнопка «🔔 Уведомления». Группа " + GROUP_NAME + start_note(update.effective_user.id),
         reply_markup=KEYBOARD,
     )
 
 
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS пуст: никто не сможет создавать ключи и пользоваться админ-командами")
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    app.add_handler(MessageHandler(filters.ALL, antispam), group=-1)  # проверка на спам идёт первой
+    app.add_handler(MessageHandler(filters.ALL, antispam), group=-2)  # проверка на спам идёт первой
+    app.add_handler(TypeHandler(Update, access_gate), group=-1)        # потом проверка ключа доступа
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("subscribe", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
@@ -1193,6 +1785,17 @@ def main():
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("banlist", banlist_cmd))
+    app.add_handler(CommandHandler("key", key_cmd))
+    app.add_handler(CommandHandler("keys", keys_cmd))
+    app.add_handler(CommandHandler("delkey", delkey_cmd))
+    app.add_handler(CommandHandler("access", access_cmd))
+    app.add_handler(CommandHandler("revoke", revoke_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("mykey", mykey_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
+    app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
@@ -1206,8 +1809,10 @@ def main():
     if app.job_queue is None:
         log.warning("JobQueue недоступен: установите python-telegram-bot[job-queue,webhooks]")
     else:
-        app.job_queue.run_repeating(watch_job, interval=CHECK_EVERY, first=30)
+        app.job_queue.run_repeating(watch_job, interval=CHECK_FAST, first=30)
         app.job_queue.run_daily(morning_job, time=MORNING_AT)
+        app.job_queue.run_repeating(access_job, interval=60, first=45)          # конец доступа по ключу
+        app.job_queue.run_daily(backup_job, time=dtime(3, 0, tzinfo=TZ))        # копия данных админам
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 10000)),
