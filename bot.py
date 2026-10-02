@@ -4,11 +4,11 @@
   Замены            - замены на завтра
   Замены 05.10      - замены на конкретную дату (или день недели: Замены пятница)
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
-  Спонсоры          - список спонсоров
   Расписание        - кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
   Уведомления       - вкл/выкл автоуведомления и утреннее расписание (7:00)
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
+  /msg id текст     - личное сообщение одному пользователю (только для ADMIN_IDS)
   /ban id [срок]    - заблокировать пользователя, срок: 30m, 12h, 7d (без срока - навсегда)
   /unban id         - разблокировать
   /banlist          - список заблокированных
@@ -43,7 +43,7 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["🤝 Спонсоры", "📅 Расписание"]], resize_keyboard=True, is_persistent=True
+    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["📅 Расписание"]], resize_keyboard=True, is_persistent=True
 )  # кнопки внизу
 
 # Расписание группы по дням недели (0 = понедельник ... 5 = суббота).
@@ -518,15 +518,102 @@ SPAM_REPLIES = [
 ]
 
 
+# ---------- Уведомление «тех. работы» для тех, кто в муте или в бане ----------
+
+TECH_TEXT = "⚠️ Ошибка либо бот отключён на проведение тех. работ.\nПовторите попытку позже."
+NOTICE_EVERY = 60  # не чаще одного такого ответа в минуту, чтобы бот сам не спамил в ответ
+_last_notice = {}
+
+
+def is_muted(uid: int) -> bool:
+    return _muted_until.get(uid, 0) > datetime.now().timestamp()
+
+
+async def blocked_notice(msg, uid: int):
+    now = datetime.now().timestamp()
+    if now - _last_notice.get(uid, 0) < NOTICE_EVERY:
+        return
+    _last_notice[uid] = now
+    try:
+        await msg.reply_text(TECH_TEXT)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------- Конец мута и амнистия ----------
+
+UNMUTE_REPLIES = [
+    # ---- после 1-го мута ----
+    [
+        "😏 Ну что, отсидел своё? Мут снят, можешь снова со мной разговаривать. "
+        "Только по одному нажатию за раз, а не как будто ты на пианино играешь. Я за тобой слежу 👀",
+        "🔔 Дзынь! Твой срок в игноре закончился. Выглядишь посвежевшим, подышал воздухом? "
+        "Отлично. Теперь веди себя прилично: одна кнопка — один раз. Я проверю.",
+    ],
+    # ---- после 2-го мута ----
+    [
+        "🙄 Ну здравствуй, старый знакомый. Мут снят. Надеюсь, ты не просидел всё это время, "
+        "придумывая, как бы снова меня достать? Давай в этот раз без цирка, ладно?",
+        "😒 Время вышло, ты свободен. Но я тебя запомнил, и мой список «любимчиков» пополнился. "
+        "Ещё раз — и сидеть будешь дольше. Жми аккуратно.",
+    ],
+    # ---- после 3-го и следующих мутов ----
+    [
+        "😤 Мут снят. Да-да, я тоже не в восторге, что мы снова встретились. "
+        "Ты у меня уже в постоянных клиентах «комнаты тишины». Хочешь выйти из этого списка — "
+        "просто нажимай кнопки по одной. Это правда не сложно.",
+        "🧊 Ты свободен. Но мой запас терпения почти закончился, как заряд у телефона в конце дня. "
+        "Дальше — только бан. Ты же умный человек, правда?",
+    ],
+]
+
+AMNESTY_REPLIES = [
+    "🕊 Объявляется амнистия! Ты давно не спамил, и я решил, что ты исправился. "
+    "Все твои нарушения обнулены, начинаем с чистого листа. Спасибо, что пользуешься ботом спокойно, "
+    "так держать! 🙂",
+    "🌟 Хорошие новости: ты вёл себя достойно, поэтому все предупреждения аннулированы. "
+    "У тебя снова чистая репутация. Приятного пользования, и спасибо за уважение к боту! 🤝",
+]
+
+
+async def _safe_send(bot, chat_id, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except (Forbidden, BadRequest):  # человек заблокировал бота
+        pass
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось отправить сообщение %s", chat_id)
+
+
+async def unmute_job(context: ContextTypes.DEFAULT_TYPE):
+    """Мут закончился - сообщаем об этом (если за это время не было нового мута или бана)."""
+    uid, chat_id, stamp, level = context.job.data
+    if is_banned(uid) or _muted_until.get(uid) != stamp:
+        return
+    await _safe_send(context.bot, chat_id, random.choice(UNMUTE_REPLIES[level]))
+
+
+async def amnesty_job(context: ContextTypes.DEFAULT_TYPE):
+    """Долго не было нарушений - счётчик обнуляется, человек получает уведомление об амнистии."""
+    uid, chat_id, stamp = context.job.data
+    strike = _strikes.get(uid)
+    if is_banned(uid) or not strike or strike[1] != stamp:  # был новый мут - амнистия отменяется
+        return
+    del _strikes[uid]
+    await _safe_send(context.bot, chat_id, random.choice(AMNESTY_REPLIES))
+
+
 async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
     if is_banned(user.id):
-        raise ApplicationHandlerStop  # бан: молча игнорируем всё, в том числе /start
+        await blocked_notice(msg, user.id)
+        raise ApplicationHandlerStop  # бан: ничего не выполняем, в том числе /start
     now = msg.date.timestamp()  # время отправки сообщения, а не обработки: бот обрабатывает по очереди
     if _muted_until.get(user.id, 0) > now:
         track(update)
+        await blocked_notice(msg, user.id)
         raise ApplicationHandlerStop  # игнор, пока действует мут
     q = _recent[user.id]
     q.append(now)
@@ -540,6 +627,13 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _strikes[user.id] = strike
         q.clear()
         track(update, spam=True)
+        _last_notice[user.id] = datetime.now().timestamp()  # «тех. работы» появятся не сразу после ругани
+        if context.job_queue:  # уведомим, когда мут закончится и когда пройдёт амнистия
+            until, now_real = _muted_until[user.id], datetime.now().timestamp()
+            context.job_queue.run_once(unmute_job, max(1, until - now_real),
+                                       data=(user.id, msg.chat_id, until, level))
+            context.job_queue.run_once(amnesty_job, max(1, until + SPAM_FORGET - now_real),
+                                       data=(user.id, msg.chat_id, until))
         text = random.choice(SPAM_REPLIES[level]).replace("{t}", SPAM_MUTE_TEXT[level])
         await msg.reply_text(text[:4000])
         raise ApplicationHandlerStop
@@ -769,8 +863,8 @@ async def schedule_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if is_banned(q.from_user.id):
-        await q.answer()
+    if is_banned(q.from_user.id) or is_muted(q.from_user.id):
+        await q.answer(TECH_TEXT, show_alert=True)
         return
     now = datetime.now().timestamp()
     recent = _cb_recent[q.from_user.id]
@@ -902,8 +996,6 @@ def classify(text):
         return "замены"
     if "уведомлен" in t:
         return "уведомления"
-    if "спонсор" in t:
-        return "спонсоры"
     if "расписан" in t:
         return "расписание"
     return "другое"
@@ -971,6 +1063,33 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Готово. Подписчиков сейчас: {len(DATA['subs'])} (из {n}).", reply_markup=KEYBOARD)
 
 
+async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/msg id текст - личное сообщение одному пользователю (только для ADMIN_IDS)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда только для админа.")
+        return
+    parts = re.split(r"\s+", update.message.text.strip(), maxsplit=2)
+    if len(parts) < 3 or not parts[1].lstrip("-").isdigit() or not parts[2].strip():
+        await update.message.reply_text("Напиши id и текст:\n/msg 123456789 Подойди к старосте",
+                                        reply_markup=KEYBOARD)
+        return
+    uid, body = int(parts[1]), parts[2].strip()
+    if len(body) > 3900:
+        await update.message.reply_text("Слишком длинный текст, сократи до 3900 символов.", reply_markup=KEYBOARD)
+        return
+    name = DATA["stats"]["users"].get(str(uid), {}).get("name") or "без имени"
+    try:
+        await context.bot.send_message(uid, f"✉️ Сообщение от администратора:\n\n{body}")
+    except Forbidden:
+        await update.message.reply_text(f"❌ Не отправлено: {name} ({uid}) заблокировал бота.", reply_markup=KEYBOARD)
+        return
+    except BadRequest:
+        await update.message.reply_text(f"❌ Не отправлено: бот не знает id {uid} (человек ни разу не писал боту).",
+                                        reply_markup=KEYBOARD)
+        return
+    await update.message.reply_text(f"✅ Отправлено: {name} ({uid})", reply_markup=KEYBOARD)
+
+
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/ban id [срок] - заблокировать пользователя (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
@@ -1029,30 +1148,6 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
 
-# ---------- Спонсоры ----------
-# Чтобы добавить спонсора, допиши ещё один текст в список SPONSORS.
-
-SPONSORS = [
-    "🔋 Замена аккумуляторов на телефонах\n\n"
-    "Телефон садится к обеду, внезапно выключается или греется? "
-    "Скорее всего, дело в аккумуляторе, а не в самом телефоне.\n\n"
-    "Меняю аккумуляторы на iPhone и Android на профессиональном оборудовании. "
-    "Работаю аккуратно, подбираю подходящую батарею под вашу модель, "
-    "после замены проверяю, как телефон держит заряд.\n\n"
-    "✅ iPhone и Android\n"
-    "✅ Профессиональное оборудование\n"
-    "✅ Аккуратная работа без лишних вмешательств\n"
-    "✅ Проверка после замены\n\n"
-    "Вернём телефону нормальную автономию 🔌\n\n"
-    "📩 Писать: @Inkonasik",
-]
-
-
-async def sponsors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🤝 Спонсоры бота\n\n" + "\n\n———\n\n".join(SPONSORS)
-    await update.message.reply_text(text[:4000], reply_markup=KEYBOARD)
-
-
 # ---------- Болталка ----------
 
 GREET = ["Привет! 👋 Жми кнопку внизу.", "Здарова! Замены или пары?", "О, привет! Что показать?",
@@ -1077,7 +1172,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«Замены» — замены на завтра. «Есть ли замены?» — выложены ли они. "
         "«Пары завтра» — расписание с учётом замен.\n"
         "«📅 Расписание» — расписание на любой день недели (Пн–Сб), там же можно глянуть замены.\n"
-        "«🤝 Спонсоры» — наши партнёры.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         "🔔 Я включил уведомления: напишу сам, когда выложат замены, и в 7:00 пришлю расписание на день. "
         "Выключить — кнопка «🔔 Уведомления». Группа " + GROUP_NAME,
@@ -1095,6 +1189,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("send", send_cmd))
+    app.add_handler(CommandHandler("msg", msg_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("banlist", banlist_cmd))
@@ -1103,7 +1198,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*пары"), lessons_day))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(📅\s*)?расписан"), schedule_button))
     app.add_handler(CallbackQueryHandler(schedule_cb, pattern=r"^sch:"))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🤝\s*)?спонсор"), sponsors))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(замен|debug)"), zameny))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(привет|здаров|здравствуй|хай|ку)\b"), talk(GREET)))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(спасибо|благодарю|спс|сяп)"), talk(THANKS)))
