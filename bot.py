@@ -18,6 +18,7 @@
   /delkey КЛЮЧ      - удалить ключ;  /revoke id - забрать доступ у человека
   /access on|off    - включить/выключить проверку ключа (on all - сбросить доступ даже у тех, кто вводил ключ)
   /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
+  /unbankey [кол-во] - ключ разбана: снимает бан или блокировку за частый спам (только для ADMIN_IDS)
   /mykey            - свой статус доступа
   debug             - как бот разобрал файл (для проверки)
 """
@@ -106,6 +107,7 @@ def fix_data(d):
         acc["allowed"] = {str(u): {"until": 0, "granted": 0, "warned": False} for u in acc["allowed"]}
     for k in acc["keys"].values():
         k.setdefault("dur", 0)
+        k.setdefault("kind", "access")  # access - даёт доступ, unban - снимает бан
     for uid in os.environ.get("ACCESS_IDS", "").replace(" ", "").split(","):  # запасной список (диск мог стереться)
         if uid.lstrip("-").isdigit():
             acc["allowed"].setdefault(str(int(uid)), {"until": 0, "granted": 0, "warned": False})
@@ -505,7 +507,8 @@ def ban_label(uid: str, ban: dict) -> str:
     name = ban.get("name") or DATA["stats"]["users"].get(uid, {}).get("name") or "без имени"
     until = ban.get("until", 0)
     end = f"до {datetime.fromtimestamp(until, TZ):%d.%m %H:%M}" if until else "навсегда"
-    return f"{uid} — {name} ({end})"
+    why = ", антиспам" if ban.get("reason") == "spam" else ""
+    return f"{uid} — {name} ({end}{why})"
 
 
 # ---------- Ключи доступа ----------
@@ -571,27 +574,32 @@ def key_state(k: dict) -> str:
     return "used" if k["uses"] >= k["max_uses"] else "ok"
 
 
-def redeem_key(uid: int, raw: str) -> str:
-    """Применяет ключ. Возвращает 'ok' / 'invalid' / 'used'."""
+def redeem_key(uid: int, raw: str, kind: str = "access") -> str:
+    """Применяет ключ нужного типа. Возвращает 'ok' / 'invalid' / 'used'."""
     k = DATA["access"]["keys"].get(norm_key(raw))
-    if not k:
+    if not k or k.get("kind", "access") != kind:
         return "invalid"
     if key_state(k) == "used":
         return "used"
     k["uses"] += 1
     k["users"].append(uid)
-    grant(uid, k["dur"])
+    if kind == "unban":
+        DATA["banned"].pop(str(uid), None)
+        _muted_until.pop(uid, None)
+        _strikes.pop(uid, None)
+    else:
+        grant(uid, k["dur"])
     save_data()
     return "ok"
 
 
-def create_key(uses: int, dur: int) -> str:
+def create_key(uses: int, dur: int, kind: str = "access") -> str:
     keys = DATA["access"]["keys"]
     while True:
         key = "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
         if key not in keys:
             break
-    keys[key] = {"created": time.time(), "dur": dur, "max_uses": uses, "uses": 0, "users": []}
+    keys[key] = {"created": time.time(), "dur": dur, "max_uses": uses, "uses": 0, "users": [], "kind": kind}
     save_data()
     return key
 
@@ -628,16 +636,17 @@ FAIL_LIMIT, FAIL_WINDOW, FAIL_LOCK = 5, 600, 900   # 5 неверных ключ
 _key_fails = {}                                    # user_id -> [число ошибок, начало окна, пауза до]
 
 
-def try_key(uid: int, raw: str) -> str:
+def try_key(uid: int, raw: str, kind: str = "access") -> str:
     """Применяет ключ с защитой от перебора. Возвращает 'ok' / 'invalid' / 'used' / 'forever' / 'locked'."""
     now = time.time()
     f = _key_fails.get(uid)
     if f and f[2] > now:
         return "locked"
     a = DATA["access"]["allowed"].get(str(uid))
-    if a and not a["until"] and DATA["access"]["keys"].get(norm_key(raw)):
+    k0 = DATA["access"]["keys"].get(norm_key(raw))
+    if kind == "access" and a and not a["until"] and k0 and k0.get("kind", "access") == "access":
         return "forever"  # доступ уже вечный: ключ не расходуем
-    res = redeem_key(uid, raw)
+    res = redeem_key(uid, raw, kind)
     if res == "invalid":
         if not f or now - f[1] > FAIL_WINDOW:
             f = [0, now, 0]
@@ -838,6 +847,16 @@ SPAM_REPLIES = [
 # ---------- Уведомление «тех. работы» для тех, кто в муте или в бане ----------
 
 TECH_TEXT = "⚠️ Ошибка либо бот отключён на проведение тех. работ.\nПовторите попытку позже."
+SPAM_LOCK_AT = 4  # на столько-м нарушении за короткое время человек блокируется до ключа разбана
+
+
+def lock_ban_text() -> str:
+    who = f" ({ADMIN_CONTACT})" if ADMIN_CONTACT else ""
+    return ("🚫 Ты слишком часто нарушал правила (спам), поэтому доступ закрыт.\n\n"
+            f"Чтобы вернуться, нужен ключ разбана: его выдаёт администратор{who}. "
+            "Отправь ключ сообщением (вид XXXX-XXXX).")
+
+
 NOTICE_EVERY = 5  # не чаще одного такого ответа в 5 секунд, чтобы бот сам не спамил в ответ
 _last_notice = {}
 
@@ -852,7 +871,8 @@ async def blocked_notice(msg, uid: int):
         return
     _last_notice[uid] = now
     try:
-        await msg.reply_text(TECH_TEXT)
+        ban = DATA["banned"].get(str(uid)) or {}
+        await msg.reply_text(lock_ban_text() if ban.get("reason") == "spam" else TECH_TEXT)
         log.info("уведомление «тех. работы» отправлено пользователю %s", uid)
     except Exception as e:  # noqa: BLE001
         log.warning("не удалось отправить уведомление «тех. работы» пользователю %s: %r", uid, e)
@@ -921,11 +941,34 @@ async def amnesty_job(context: ContextTypes.DEFAULT_TYPE):
     await _safe_send(context.bot, chat_id, random.choice(AMNESTY_REPLIES))
 
 
+async def try_unban_key(msg, user, context) -> bool:
+    """Заблокированный прислал ключ разбана? True, если сообщение обработано как ключ."""
+    text = (msg.text or "").strip()
+    m = re.match(r"(?i)^/start(?:@\w+)?\s+(.+)$", text)
+    candidate = m.group(1) if m else ("" if text.startswith("/") else text)
+    if not candidate or len(candidate) > 40 or len(norm_key(candidate)) != 8:
+        return False
+    res = try_key(user.id, candidate, "unban")
+    if res == "ok":
+        await msg.reply_text("✅ Ключ принят, блокировка снята. Можно пользоваться ботом.", reply_markup=KEYBOARD)
+        name = user.full_name + (f" (@{user.username})" if user.username else "")
+        for admin in ADMIN_IDS:
+            await _safe_send(context.bot, admin, f"🔓 {name} ({user.id}) снял блокировку ключом разбана.")
+    else:
+        await msg.reply_text(KEY_ERRORS.get(res, KEY_ERRORS["invalid"]))
+    return True
+
+
 async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
+    if user.id in ADMIN_IDS:  # админа не мутим и не банним, иначе при проверке команд он сам себя заблокирует
+        track(update)
+        return
     if is_banned(user.id):
+        if await try_unban_key(msg, user, context):
+            raise ApplicationHandlerStop
         await blocked_notice(msg, user.id)
         raise ApplicationHandlerStop  # бан: ничего не выполняем, в том числе /start
     now = msg.date.timestamp()  # время отправки сообщения, а не обработки: бот обрабатывает по очереди
@@ -939,6 +982,19 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         strike = _strikes.get(user.id, [0, 0])
         if now - strike[1] > SPAM_FORGET:
             strike[0] = 0  # давно не спамил - начинаем сначала
+        if strike[0] + 1 >= SPAM_LOCK_AT:  # слишком часто: блокировка, снять можно ключом разбана или /unban
+            name = user.full_name + (f" (@{user.username})" if user.username else "")
+            q.clear()
+            _strikes.pop(user.id, None)
+            _muted_until.pop(user.id, None)
+            DATA["banned"][str(user.id)] = {"name": name, "until": 0, "reason": "spam"}
+            track(update, spam=True)  # заодно сохраняет данные
+            await msg.reply_text(lock_ban_text())
+            for admin in ADMIN_IDS:
+                await _safe_send(context.bot, admin,
+                                 f"🚨 {name} ({user.id}) заблокирован за частый спам.\n"
+                                 "Снять: /unban id или выдать ему ключ: /unbankey")
+            raise ApplicationHandlerStop
         level = min(strike[0], len(SPAM_MUTES) - 1)
         strike[0] += 1
         strike[1] = _muted_until[user.id] = now + SPAM_MUTES[level]
@@ -1375,7 +1431,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/send текст - рассылка всем подписчикам (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Эта команда только для админа.")
+        await update.message.reply_text(not_admin_text(update))
         return
     parts = re.split(r"\s+", update.message.text.strip(), maxsplit=1)
     text = parts[1].strip() if len(parts) > 1 else ""
@@ -1391,7 +1447,7 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/msg id текст - личное сообщение одному пользователю (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Эта команда только для админа.")
+        await update.message.reply_text(not_admin_text(update))
         return
     parts = re.split(r"\s+", update.message.text.strip(), maxsplit=2)
     if len(parts) < 3 or not parts[1].lstrip("-").isdigit() or not parts[2].strip():
@@ -1418,7 +1474,7 @@ async def msg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/ban id [срок] - заблокировать пользователя (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Эта команда только для админа.")
+        await update.message.reply_text(not_admin_text(update))
         return
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
@@ -1440,13 +1496,14 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = DATA["stats"]["users"].get(str(uid), {}).get("name", "")
     DATA["banned"][str(uid)] = {"name": name, "until": until}
     save_data()
-    await update.message.reply_text(f"🚫 Заблокирован: {ban_label(str(uid), DATA['banned'][str(uid)])}", reply_markup=KEYBOARD)
+    await update.message.reply_text(f"🚫 Заблокирован: {ban_label(str(uid), DATA['banned'][str(uid)])}\n"
+                                    "Снять: /unban id или выдать ему ключ разбана: /unbankey", reply_markup=KEYBOARD)
 
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/unban id - снять блокировку (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Эта команда только для админа.")
+        await update.message.reply_text(not_admin_text(update))
         return
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
@@ -1462,7 +1519,7 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/banlist - кто сейчас заблокирован (только для ADMIN_IDS)."""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Эта команда только для админа.")
+        await update.message.reply_text(not_admin_text(update))
         return
     items = [ban_label(uid, b) for uid, b in list(DATA["banned"].items()) if is_banned(int(uid))]
     await update.message.reply_text("🚫 Заблокированные:\n" + "\n".join(items) if items else "Заблокированных нет.",
@@ -1473,12 +1530,23 @@ def _admin_only(update: Update) -> bool:
     return update.effective_user.id in ADMIN_IDS
 
 
-NOT_ADMIN = "Эта команда только для админа."
+def not_admin_text(update: Update) -> str:
+    uid = update.effective_user.id
+    if not ADMIN_IDS:
+        return (f"⚠️ Переменная ADMIN_IDS не задана на сервере, поэтому админов нет.\n"
+                f"Твой id: {uid}. Впиши его в Render → Environment → ADMIN_IDS и перезапусти сервис.")
+    return (f"Эта команда только для админа.\nТвой id: {uid}. "
+            "Если ты админ, проверь, что этот id есть в ADMIN_IDS на Render.")
 
 
 def key_card(key: str) -> str:
     k = DATA["access"]["keys"][key]
+    if k.get("kind") == "unban":
+        return (f"🔓 Ключ разбана: `{fmt_key(key)}`\nСнимает бан или блокировку за спам. "
+                "Одноразовый: одна активация.")
     note = "" if DATA["access"]["required"] else "\n\n⚠️ Проверка ключа сейчас выключена. Включить: /access on"
+    if not _gist_ready:
+        note += "\n\n⚠️ Gist не подключён: после перезапуска Render ключи и доступы пропадут. Нужны GITHUB_TOKEN и GIST_ID."
     return f"🔑 Ключ: `{fmt_key(key)}`\nДоступ: {dur_label(k['dur'])}\nОдноразовый: подходит для одной активации{note}"
 
 
@@ -1488,7 +1556,8 @@ def keys_text() -> str:
     for key, k in sorted(acc["keys"].items(), key=lambda kv: -kv[1]["created"]):
         mark = "☑️" if key_state(k) == "used" else "✅"
         who = f", ввёл {k['users'][0]}" if k["users"] else ""
-        lines.append(f"{mark} {fmt_key(key)} — доступ {dur_label(k['dur'])}{who}")
+        what = "ключ разбана" if k.get("kind") == "unban" else f"доступ {dur_label(k['dur'])}"
+        lines.append(f"{mark} {fmt_key(key)} — {what}{who}")
     if not acc["keys"]:
         lines.append("Ключей нет. Создать: /key или /admin")
     return "\n".join(lines)[:4000]
@@ -1508,7 +1577,7 @@ def users_text() -> str:
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/key [кол-во] [срок] - создать ключ доступа (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     args = context.args or []
     dur, count = 0, 1
@@ -1537,10 +1606,28 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n".join(f"`{fmt_key(k)}`" for k in keys) + note, parse_mode="Markdown", reply_markup=KEYBOARD)
 
 
+async def unbankey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unbankey [кол-во] - ключи разбана (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    args = context.args or []
+    count = 1
+    if args:
+        if not args[0].isdigit() or not 1 <= int(args[0]) <= 30:
+            await update.message.reply_text("Сколько ключей — число от 1 до 30. Пример: /unbankey 3", reply_markup=KEYBOARD)
+            return
+        count = int(args[0])
+    keys = [create_key(1, 0, "unban") for _ in range(count)]
+    await update.message.reply_text(
+        f"🔓 Ключей разбана: {count}. Каждый одноразовый, снимает бан или блокировку за спам.\n\n"
+        + "\n".join(f"`{fmt_key(k)}`" for k in keys), parse_mode="Markdown", reply_markup=KEYBOARD)
+
+
 async def keys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/keys - список ключей (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     await update.message.reply_text(keys_text(), reply_markup=KEYBOARD)
 
@@ -1548,7 +1635,7 @@ async def keys_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/users - у кого есть доступ и до какого времени (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     await update.message.reply_text(users_text(), reply_markup=KEYBOARD)
 
@@ -1556,7 +1643,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/delkey КЛЮЧ - удалить ключ (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     args = context.args or []
     if not args:
@@ -1573,7 +1660,7 @@ async def delkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/access on|off - включить/выключить проверку ключа (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     args = [a.lower() for a in (context.args or [])]
     if not args or args[0] not in ("on", "off", "вкл", "выкл"):
@@ -1591,7 +1678,7 @@ async def access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/revoke id - забрать доступ у пользователя (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
@@ -1624,6 +1711,7 @@ def admin_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [B("🔑 На 1 день", callback_data="adm:key:1d"), B("🔑 На 7 дней", callback_data="adm:key:7d")],
         [B("🔑 На 30 дней", callback_data="adm:key:30d"), B("🔑 Навсегда", callback_data="adm:key:0")],
+        [B("🔓 Ключ разбана", callback_data="adm:unban")],
         [B("📋 Ключи", callback_data="adm:keys"), B("👥 Люди", callback_data="adm:users")],
         [B("🔓 Выключить проверку ключа" if on else "🔒 Включить проверку ключа", callback_data="adm:toggle")],
     ])
@@ -1632,7 +1720,7 @@ def admin_markup() -> InlineKeyboardMarkup:
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/admin - панель с кнопками (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     on = DATA["access"]["required"]
     await update.message.reply_text(
@@ -1653,6 +1741,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dur = parse_term(action[4:])
         if dur is not None:
             await context.bot.send_message(chat_id, key_card(create_key(1, dur)), parse_mode="Markdown")
+    elif action == "unban":
+        await context.bot.send_message(chat_id, key_card(create_key(1, 0, "unban")), parse_mode="Markdown")
     elif action == "keys":
         await context.bot.send_message(chat_id, keys_text())
     elif action == "users":
@@ -1682,7 +1772,7 @@ async def send_backup(bot, chat_id):
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/backup - прислать файл с данными (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     await send_backup(context.bot, update.effective_chat.id)
 
@@ -1698,7 +1788,7 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE):
 async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Файл резервной копии с подписью /restore - вернуть данные (только для ADMIN_IDS)."""
     if not _admin_only(update):
-        await update.message.reply_text(NOT_ADMIN)
+        await update.message.reply_text(not_admin_text(update))
         return
     doc = update.message.document
     if doc.file_size and doc.file_size > 5_000_000:
@@ -1768,6 +1858,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_last_err = [0.0]
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Ошибка в обработчике", exc_info=context.error)
+    now = time.time()
+    if now - _last_err[0] < 30:  # не чаще раза в 30 секунд
+        return
+    _last_err[0] = now
+    cmd = ""
+    if isinstance(update, Update) and update.effective_message and update.effective_message.text:
+        cmd = f" при «{update.effective_message.text[:40]}»"
+    for admin in ADMIN_IDS:
+        await _safe_send(context.bot, admin, f"🐞 Ошибка бота{cmd}: {context.error!r}"[:500])
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
     if not ADMIN_IDS:
@@ -1787,6 +1893,7 @@ def main():
     app.add_handler(CommandHandler("banlist", banlist_cmd))
     app.add_handler(CommandHandler("key", key_cmd))
     app.add_handler(CommandHandler("keys", keys_cmd))
+    app.add_handler(CommandHandler("unbankey", unbankey_cmd))
     app.add_handler(CommandHandler("delkey", delkey_cmd))
     app.add_handler(CommandHandler("access", access_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
@@ -1806,6 +1913,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(спасибо|благодарю|спс|сяп)"), talk(THANKS)))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(пока|до свидания|бывай)\b"), talk(BYE)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, talk(UNKNOWN)))  # всё остальное
+    app.add_error_handler(on_error)
     if app.job_queue is None:
         log.warning("JobQueue недоступен: установите python-telegram-bot[job-queue,webhooks]")
     else:
