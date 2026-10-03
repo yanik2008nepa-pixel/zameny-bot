@@ -18,7 +18,7 @@
   /delkey КЛЮЧ      - удалить ключ;  /revoke id - забрать доступ у человека
   /access on|off    - включить/выключить проверку ключа (on all - сбросить доступ даже у тех, кто вводил ключ)
   /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
-  /unbankey [кол-во] - ключ разбана: снимает бан или блокировку за частый спам (только для ADMIN_IDS)
+  /unbankey [кол-во] - ключ разбана: снимает бан, блокировку за частый спам или мут (только для ADMIN_IDS)
   /mykey            - свой статус доступа
   debug             - как бот разобрал файл (для проверки)
 """
@@ -959,15 +959,22 @@ async def try_unban_key(msg, user, context) -> bool:
     candidate = m.group(1) if m else ("" if text.startswith("/") else text)
     if not candidate or len(candidate) > 40 or len(norm_key(candidate)) != 8:
         return False
+    was_muted = is_muted(user.id)
     res = try_key(user.id, candidate, "unban")
     if res == "ok":
-        await msg.reply_text("✅ Ключ принят, блокировка снята. Можно пользоваться ботом.", reply_markup=KEYBOARD)
+        _recent[user.id].clear()
+        what = "мут" if was_muted else "блокировка"
+        await msg.reply_text(f"✅ Ключ принят, {what} снят{'' if was_muted else 'а'}. Можно пользоваться ботом.",
+                             reply_markup=KEYBOARD)
         name = user.full_name + (f" (@{user.username})" if user.username else "")
         for admin in ADMIN_IDS:
-            await _safe_send(context.bot, admin, f"🔓 {name} ({user.id}) снял блокировку ключом разбана.")
+            await _safe_send(context.bot, admin, f"🔓 {name} ({user.id}) снял {'мут' if was_muted else 'блокировку'} ключом разбана.")
     else:
         await msg.reply_text(KEY_ERRORS.get(res, KEY_ERRORS["invalid"]))
     return True
+
+
+MUTE_KEY_RE = re.compile(r"^[A-Za-z0-9]{4}-?[A-Za-z0-9]{4}$")  # вид ключа XXXX-XXXX (в муте реагируем только на него)
 
 
 async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -985,6 +992,8 @@ async def antispam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = msg.date.timestamp()  # время отправки сообщения, а не обработки: бот обрабатывает по очереди
     if _muted_until.get(user.id, 0) > now:
         track(update)
+        if MUTE_KEY_RE.match((msg.text or "").strip()) and await try_unban_key(msg, user, context):
+            raise ApplicationHandlerStop  # прислал ключ разбана: мут снят (или ключ неверный)
         await blocked_notice(msg, user.id)
         raise ApplicationHandlerStop  # игнор, пока действует мут
     q = _recent[user.id]
@@ -2232,7 +2241,7 @@ async def unbankey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = int(args[0])
     keys = [create_key(1, 0, "unban") for _ in range(count)]
     await update.message.reply_text(
-        f"🔓 Ключей разбана: {count}. Каждый одноразовый, снимает бан или блокировку за спам.\n\n"
+        f"🔓 Ключей разбана: {count}. Каждый одноразовый, снимает бан, блокировку за спам или мут.\n\n"
         + "\n".join(f"`{fmt_key(k)}`" for k in keys), parse_mode="Markdown", reply_markup=KEYBOARD)
 
 
