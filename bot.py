@@ -1,11 +1,12 @@
 """Telegram-бот: замены для группы 01-24 из PDF на Яндекс Диске.
 
 Команды в чате:
+  Другое            - меню с разделами: Расписание, Уведомления, Помощь (то же самое: /menu)
   Замены            - замены на завтра
   Замены 05.10      - замены на конкретную дату (или день недели: Замены пятница)
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
-  Расписание        - кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
-  Уведомления       - настройки: замены (вкл/выкл), расписание на день (по умолчанию 7:00) и расписание на завтра
+  Расписание        - (в меню «Другое») кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
+  Уведомления       - (в меню «Другое») настройки: замены (вкл/выкл), расписание на день (по умолчанию 7:00) и расписание на завтра
                       (по умолчанию 20:00): у обоих расписаний вкл/выкл и своё время; там же кнопка «Помощь»
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
@@ -57,9 +58,12 @@ TZ = ZoneInfo("Europe/Minsk")
 API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
+MENU_BUTTON = "⚙️ Другое"
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", "🔔 Уведомления"], ["📅 Расписание"]], resize_keyboard=True, is_persistent=True
-)  # кнопки внизу
+    [["Замены", "Есть ли замены?"], ["Пары завтра", MENU_BUTTON]], resize_keyboard=True, is_persistent=True
+)  # кнопки внизу; Расписание, Уведомления и Помощь спрятаны в меню «Другое»
+MENU_BACK = "menu:o"        # callback_data кнопки «Назад»: возвращает в меню «Другое»
+BACK_LABEL = "↩️ Назад"
 
 # Расписание группы по дням недели (0 = понедельник ... 5 = суббота).
 # Номер в списке = номер урока (1-й элемент = урок 1). Пустая строка = урока нет.
@@ -1181,7 +1185,7 @@ FUN = {
         "Тишина — значит, ещё пишут. Заходи позже 📝",
         "Пока замен нет, живём по расписанию 🤞",
         "Файла ещё нет. Преподаватели тоже не всегда знают заранее 🤷",
-        "Пока затишье. Включи «🔔 Уведомления», и я скажу, когда появится",
+        "Пока затишье. Включи уведомления («⚙️ Другое» → «🔔 Уведомления»), и я скажу, когда появится",
         "Чашка чая — и проверь позже ☕",
         "Не нервничай: как только выложат, всё будет тут 📬",
         "Ожидание — тоже часть учебного процесса ⏳",
@@ -1227,7 +1231,7 @@ FUN = {
         "Преподаватели ещё думают 🤔",
         "Пока нет. Но я смотрю, ага 👀",
         "Файла нет — значит, пока всё стабильно (или просто не успели) 😏",
-        "Выложат — скажу. Включи «🔔 Уведомления», чтобы не проверять самому",
+        "Выложат — скажу. Включи уведомления («⚙️ Другое» → «🔔 Уведомления»), чтобы не проверять самому",
         "Свежих замен нет. Можно выдохнуть… пока 😮‍💨",
         "Пусто. Загляни чуть позже ⏰",
         "Файл в пути, как почта в понедельник 🐌",
@@ -1299,7 +1303,7 @@ FUN = {
     # «Пары завтра»: замены ещё не выложены
     "sched_notposted": [
         "Это расписание по плану, замены ещё могут добавиться ⏳",
-        "Включи «🔔 Уведомления» — напишу, когда появятся замены",
+        "Включи уведомления («⚙️ Другое» → «🔔 Уведомления») — напишу, когда появятся замены",
         "Пока смотрим на базовый план 🗺",
         "Расписание есть, замен нет — пока что 🤞",
         "План А готов, план Б (замены) ждёт своего часа 📬",
@@ -1661,13 +1665,36 @@ CB_COUNT, CB_WINDOW = 8, 5.0  # не больше 8 нажатий за 5 сек
 _cb_recent = defaultdict(lambda: deque(maxlen=CB_COUNT))
 
 
+async def cb_guard(q) -> bool:
+    """True, если нажатие надо отклонить (бан, мут, слишком частые нажатия). Ответ на кнопку уже отправлен."""
+    uid = q.from_user.id
+    if is_banned(uid) or is_muted(uid):
+        await q.answer(TECH_TEXT, show_alert=True)
+        return True
+    now = datetime.now().timestamp()
+    recent = _cb_recent[uid]
+    recent.append(now)
+    if len(recent) == CB_COUNT and now - recent[0] <= CB_WINDOW:
+        await q.answer("Не так быстро 🙂")
+        return True
+    return False
+
+
+def from_menu(q) -> bool:
+    """Экран открыт из меню «Другое»? Видно по кнопке «Назад» в самом сообщении (ничего не храним, переживает перезапуск)."""
+    markup = getattr(q.message, "reply_markup", None)
+    rows = markup.inline_keyboard if markup else ()
+    return any(b.callback_data in (MENU_BACK, "ntf:bm") for row in rows for b in row)
+
+
 def nearest_date(wd: int, today: date) -> date:
     """Ближайшая дата с таким днём недели, считая сегодняшний."""
     return today + timedelta(days=(wd - today.weekday()) % 7)
 
 
-def schedule_markup(sel=None, mode="d"):
-    """Кнопки Пн-Сб (сегодня помечен точкой, выбранный - в скобках) и переключатель замен."""
+def schedule_markup(sel=None, mode="d", back=False):
+    """Кнопки Пн-Сб (сегодня помечен точкой, выбранный - в скобках) и переключатель замен.
+    back=True: экран открыт из меню «Другое», добавляем «Назад»."""
     today_wd = datetime.now(TZ).date().weekday()
     btns = []
     for i, ab in enumerate(WD_ABBR):
@@ -1681,6 +1708,8 @@ def schedule_markup(sel=None, mode="d"):
             rows.append([InlineKeyboardButton("📋 Без замен", callback_data=f"sch:d:{sel}")])
         else:
             rows.append([InlineKeyboardButton("🔄 С заменами", callback_data=f"sch:r:{sel}")])
+    if back:
+        rows.append([InlineKeyboardButton(BACK_LABEL, callback_data=MENU_BACK)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1733,7 +1762,7 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("ошибка расписания")
             text = f"Не получилось собрать расписание: {e}"
     try:
-        await q.edit_message_text(text[:4000], reply_markup=schedule_markup(wd, mode))
+        await q.edit_message_text(text[:4000], reply_markup=schedule_markup(wd, mode, back=from_menu(q)))
     except BadRequest as e:
         if "not modified" not in str(e).lower():  # повторное нажатие на тот же день - не ошибка
             raise
@@ -1835,7 +1864,7 @@ def notif_text(chat_id: int) -> str:
     ])
 
 
-def notif_markup(chat_id: int) -> InlineKeyboardMarkup:
+def notif_markup(chat_id: int, back: bool = False) -> InlineKeyboardMarkup:
     alerts, p, B = chat_id in DATA["subs"], get_pref(chat_id), InlineKeyboardButton
     rows = [[B(f"{'🔔' if alerts else '🔕'} Замены: {'вкл' if alerts else 'выкл'}", callback_data="ntf:a")],
             [B(f"{'☀️' if p['morning'] else '🌙'} Расписание на день: {'вкл' if p['morning'] else 'выкл'}", callback_data="ntf:m")]]
@@ -1845,6 +1874,8 @@ def notif_markup(chat_id: int) -> InlineKeyboardMarkup:
     if p["evening"]:
         rows.append([B(f"⏰ Время (завтра): {p['etime']}", callback_data="ntf:et")])
     rows.append([B("🆘 Помощь", callback_data="ntf:h")])
+    if back:  # экран открыт из меню «Другое»
+        rows.append([B(BACK_LABEL, callback_data=MENU_BACK)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1857,7 +1888,7 @@ CB_CODES = {"m": {"toggle": "m", "menu": "t", "set": "s", "custom": "c"},
             "e": {"toggle": "e", "menu": "et", "set": "es", "custom": "ec"}}
 
 
-def time_markup(chat_id: int, kind: str = "m") -> InlineKeyboardMarkup:
+def time_markup(chat_id: int, kind: str = "m", back: bool = False) -> InlineKeyboardMarkup:
     k, codes, B = KINDS[kind], CB_CODES[kind], InlineKeyboardButton
     cur = get_pref(chat_id)[k["time"]]
     btns = [B(("✅ " if t == cur else "") + t, callback_data=f"ntf:{codes['set']}:" + t.replace(":", ""))
@@ -1865,10 +1896,10 @@ def time_markup(chat_id: int, kind: str = "m") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([btns[:3], btns[3:],
                                  [B("✏️ Своё время", callback_data="ntf:" + codes["custom"])],
                                  [B("🔕 Выключить", callback_data="ntf:" + codes["toggle"])],
-                                 [B("↩️ Назад", callback_data="ntf:b")]])
+                                 [B(BACK_LABEL, callback_data="ntf:bm" if back else "ntf:b")]])  # bm = назад, но «Назад в меню» остаётся
 
 
-AWAIT_TIME = {}  # chat_id -> (до какого момента (monotonic), вид "m"/"e"): ждём время, написанное текстом
+AWAIT_TIME = {}  # chat_id -> (до какого момента (monotonic), вид "m"/"e", открыто из меню «Другое»?): ждём время текстом
 
 
 class _AwaitTime(filters.MessageFilter):
@@ -1939,6 +1970,7 @@ async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = q.message.chat_id
     parts = q.data.split(":")
     act = parts[1] if len(parts) > 1 else ""
+    back = from_menu(q)  # открыто из меню «Другое» - сохраняем кнопку «Назад» на всех экранах
     AWAIT_TIME.pop(cid, None)
     kind = "e" if act in ("e", "et", "es", "ec") else "m"
     note = ""
@@ -1954,7 +1986,7 @@ async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = f"☀️ Расписание {what} включено — в {hhmm}" if on else f"🌙 Расписание {what} выключено"
     elif act in ("t", "et"):
         await q.answer()
-        await _edit(q, TIME_TEXT[kind], time_markup(cid, kind))
+        await _edit(q, TIME_TEXT[kind], time_markup(cid, kind, back))
         return
     elif act in ("s", "es") and len(parts) > 2:
         hhmm = parse_hhmm(parts[2][:2] + ":" + parts[2][2:])
@@ -1962,18 +1994,18 @@ async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_schedule_time(cid, kind, hhmm)
             note = f"⏰ Расписание {'на день' if kind == 'm' else 'на завтра'} буду присылать в {hhmm}"
     elif act in ("c", "ec"):
-        AWAIT_TIME[cid] = (time.monotonic() + 600, kind)
+        AWAIT_TIME[cid] = (time.monotonic() + 600, kind, back)
         await q.answer()
         await _edit(q, "✏️ Напиши время сообщением, например: 6:45 или 08.15\n(от 00:00 до 23:59)",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отмена", callback_data="ntf:b")]]))
+                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отмена", callback_data="ntf:bm" if back else "ntf:b")]]))
         return
     elif act == "h":
         await q.answer()
         await _edit(q, await help_text(context.bot),
-                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Назад", callback_data="ntf:b")]]))
+                    InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data="ntf:bm" if back else "ntf:b")]]))
         return
     await q.answer(note or None)
-    await _edit(q, notif_text(cid), notif_markup(cid))
+    await _edit(q, notif_text(cid), notif_markup(cid, back))
 
 
 async def time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1983,22 +2015,74 @@ async def time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not hhmm:
         await update.message.reply_text("Не похоже на время 🤔 Напиши, например: 6:45 или 08.15 (от 00:00 до 23:59).")
         return  # продолжаем ждать
-    kind = AWAIT_TIME.pop(cid, (0, "m"))[1]
+    _, kind, back = AWAIT_TIME.pop(cid, (0, "m", False))
     set_schedule_time(cid, kind, hhmm)
     p = get_pref(cid)
     extra = "" if p[KINDS[kind]["on"]] else "\n\nСейчас это расписание выключено — включи его кнопкой ниже."
     await update.message.reply_text(f"✅ Время сохранено: {hhmm}.{extra}\n\n" + notif_text(cid),
-                                    reply_markup=notif_markup(cid))
+                                    reply_markup=notif_markup(cid, back))
+
+
+# ---------- Меню «Другое» ----------
+# Кнопка «⚙️ Другое» (или /menu) присылает сообщение с разделами. Разделы открываются прямо в нём
+# (сообщение редактируется, чат не засоряется), в каждом есть «↩️ Назад»; «✖️ Закрыть» убирает меню.
+# Текстом «Расписание» и «Уведомления» по-прежнему работают, как раньше.
+
+MENU_TEXT = "⚙️ Другое — выбери раздел:"
+SCHEDULE_TEXT = "📅 Выбери день недели — покажу расписание без замен."
+
+
+def menu_markup() -> InlineKeyboardMarkup:
+    B = InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [B("📅 Расписание", callback_data="menu:s")],
+        [B("🔔 Уведомления", callback_data="menu:n")],
+        [B("🆘 Помощь", callback_data="menu:h")],
+        [B("✖️ Закрыть", callback_data="menu:x")],
+    ])
+
+
+async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «⚙️ Другое» или /menu - показываем меню."""
+    AWAIT_TIME.pop(update.effective_chat.id, None)  # если ждали время текстом, больше не ждём
+    await update.message.reply_text(MENU_TEXT, reply_markup=menu_markup())
+
+
+async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if await cb_guard(q):
+        return
+    cid = update.effective_chat.id
+    act = q.data.split(":", 1)[1] if ":" in q.data else ""
+    AWAIT_TIME.pop(cid, None)
+    await q.answer()
+    if act == "o":      # назад в меню
+        await _edit(q, MENU_TEXT, menu_markup())
+    elif act == "s":    # расписание
+        track(update, cat="расписание", when=datetime.now(TZ))
+        await _edit(q, SCHEDULE_TEXT, schedule_markup(back=True))
+    elif act == "n":    # уведомления
+        track(update, cat="уведомления", when=datetime.now(TZ))
+        await _edit(q, notif_text(cid), notif_markup(cid, back=True))
+    elif act == "h":    # помощь
+        track(update, cat="помощь", when=datetime.now(TZ))
+        await _edit(q, await help_text(context.bot),
+                    InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data=MENU_BACK)]]))
+    elif act == "x":    # закрыть
+        try:
+            await q.delete_message()
+        except BadRequest:  # сообщению больше 48 часов - Telegram не даёт его удалить
+            await _edit(q, "Меню закрыто. Открыть снова: «" + MENU_BUTTON + "».", None)
 
 
 def sub_on_text(chat_id: int) -> str:
     p = get_pref(chat_id)
     return (f"🔔 Уведомления включены. Я напишу сам, когда выложат замены на завтра (или обновят файл), "
             f"в {p['time']} пришлю расписание на день, а в {p['etime']} — на завтра. "
-            "Настроить: кнопка «🔔 Уведомления».")
+            "Настроить: «⚙️ Другое» → «🔔 Уведомления».")
 
 
-SUB_OFF = "🔕 Уведомления выключены. Включить обратно: кнопка «🔔 Уведомления»."
+SUB_OFF = "🔕 Уведомления выключены. Включить обратно: «⚙️ Другое» → «🔔 Уведомления»."
 
 
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2139,6 +2223,8 @@ def classify(text):
         return "пары"
     if t.startswith(("замен", "debug")):
         return "замены"
+    if re.match(r"^\W*другое\W*$", t):
+        return "меню"
     if "уведомлен" in t:
         return "уведомления"
     if "расписан" in t:
@@ -2729,11 +2815,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "«Замены» — замены на завтра. «Есть ли замены?» — выложены ли они. "
         "«Пары завтра» — расписание с учётом замен.\n"
-        "«📅 Расписание» — расписание на любой день недели (Пн–Сб), там же можно глянуть замены.\n"
+        "«⚙️ Другое» — расписание на любой день недели (Пн–Сб, там же можно глянуть замены), настройки уведомлений и помощь.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         f"🔔 Я включил уведомления: напишу сам, когда выложат замены, в {get_pref(update.effective_chat.id)['time']} "
         f"пришлю расписание на день, а в {get_pref(update.effective_chat.id)['etime']} — на завтра. "
-        "Настроить (замены, расписания, время) и написать админу, если что-то не так, — кнопка «🔔 Уведомления». "
+        "Настроить уведомления (замены, расписания, время): «⚙️ Другое» → «🔔 Уведомления». "
+        "Если что-то не так — «⚙️ Другое» → «🆘 Помощь». "
         "Группа " + GROUP_NAME + start_note(update.effective_user.id),
         reply_markup=KEYBOARD,
     )
@@ -2786,6 +2873,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(notif_cb, pattern=r"^ntf:"))
+    app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu:"))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\W*другое\W*$"), menu_button))  # кнопка «⚙️ Другое»
+    app.add_handler(CommandHandler("menu", menu_button))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
     app.add_handler(MessageHandler(filters.Regex(r"^\s*\d{1,2}(\s*[:.\-]\s*\d{2})?\s*$") & _AwaitTime(), time_input))  # время текстом
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*есть ли замен"), check_changes))
