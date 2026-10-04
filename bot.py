@@ -7,7 +7,7 @@
   Пары завтра       - расписание с заменами; можно "Пары пн", "Пары 05.10", "Пары послезавтра"
   Расписание        - (в меню «Другое») кнопки Пн-Сб: расписание дня без замен, оттуда же можно открыть замены
   Уведомления       - (в меню «Другое») настройки: замены (вкл/выкл), расписание на день (по умолчанию 7:00) и расписание на завтра
-                      (по умолчанию 20:00): у обоих расписаний вкл/выкл и своё время; там же кнопка «Помощь»
+                      (по умолчанию 20:00): у обоих расписаний вкл/выкл и своё время
   /stats            - статистика (только для ADMIN_IDS)
   /send текст       - рассылка всем подписчикам (только для ADMIN_IDS)
   /msg id текст     - личное сообщение одному пользователю (только для ADMIN_IDS)
@@ -1860,7 +1860,7 @@ def notif_text(chat_id: int) -> str:
         f"• Замены: {'включены — напишу, когда выложат или обновят файл' if alerts else 'выключены'}",
         f"• Расписание на день: {'включено — пришлю в ' + p['time'] if p['morning'] else 'выключено'}",
         f"• Расписание на завтра: {'включено — пришлю в ' + p['etime'] if p['evening'] else 'выключено'}",
-        "", "Ошибки или неточности? Кнопка «🆘 Помощь».",
+        "", "Ошибки или неточности? «⚙️ Другое» → «🆘 Помощь».",
     ])
 
 
@@ -1873,7 +1873,6 @@ def notif_markup(chat_id: int, back: bool = False) -> InlineKeyboardMarkup:
     rows.append([B(f"{'🌆' if p['evening'] else '🌙'} Расписание на завтра: {'вкл' if p['evening'] else 'выкл'}", callback_data="ntf:e")])
     if p["evening"]:
         rows.append([B(f"⏰ Время (завтра): {p['etime']}", callback_data="ntf:et")])
-    rows.append([B("🆘 Помощь", callback_data="ntf:h")])
     if back:  # экран открыт из меню «Другое»
         rows.append([B(BACK_LABEL, callback_data=MENU_BACK)])
     return InlineKeyboardMarkup(rows)
@@ -1998,11 +1997,6 @@ async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         await _edit(q, "✏️ Напиши время сообщением, например: 6:45 или 08.15\n(от 00:00 до 23:59)",
                     InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отмена", callback_data="ntf:bm" if back else "ntf:b")]]))
-        return
-    elif act == "h":
-        await q.answer()
-        await _edit(q, await help_text(context.bot),
-                    InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data="ntf:bm" if back else "ntf:b")]]))
         return
     await q.answer(note or None)
     await _edit(q, notif_text(cid), notif_markup(cid, back))
