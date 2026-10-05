@@ -24,6 +24,7 @@
   /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
   /unbankey [кол-во] - ключ разбана: снимает бан, блокировку за частый спам или мут (только для ADMIN_IDS)
   /mykey            - свой статус доступа
+Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
   debug             - как бот разобрал файл (для проверки)
 """
 import asyncio
@@ -45,7 +46,7 @@ import pdfplumber
 import requests
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove,
                       Update)
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, ChatMigrated, Forbidden
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, TypeHandler, filters)
 
@@ -113,6 +114,7 @@ def new_pref(morning: bool, hhmm: str = MORNING_DEFAULT, evening: bool = False, 
 def fix_data(d):
     """Добавляет недостающие поля и переносит старые форматы."""
     d.setdefault("subs", [])
+    d.setdefault("groups", {})  # chat_id (отрицательный) -> {"title", "type", "added_by"}: группы и каналы, куда шлём только замены
     d.setdefault("notified", {})
     d.setdefault("prefs", {})  # chat_id -> {"morning"/"time"/"last": расписание на день, "evening"/"etime"/"elast": расписание на завтра}
     d.setdefault("stats", {"users": {}, "days": {}})
@@ -2129,6 +2131,85 @@ async def broadcast(bot, text: str, ids=None):
         await asyncio.sleep(0.05)
 
 
+# ---------- Группы и каналы: ТОЛЬКО уведомления о заменах ----------
+# Бота добавляют в группу/канал (в канале - администратором). Там он ничего не отвечает ни на какие
+# сообщения, кнопки и команды: только присылает то же уведомление о заменах, что и в личку.
+# Личные чаты этот блок не затрагивает.
+
+async def chat_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Самый первый обработчик: всё, что пришло из группы/канала, дальше не идёт (бот молчит).
+    Исключение - добавление/удаление бота из чата: запоминаем или забываем чат."""
+    chat = update.effective_chat
+    if chat is None or chat.type == "private":
+        return  # личка работает как раньше
+    if update.my_chat_member:
+        try:
+            await on_my_chat_member(update, context)
+        except Exception:  # noqa: BLE001
+            log.exception("ошибка при добавлении/удалении бота из чата")
+    raise ApplicationHandlerStop
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cm, bot = update.my_chat_member, context.bot
+    chat, who, status = cm.chat, cm.from_user, cm.new_chat_member.status
+    key = str(chat.id)
+    title = chat.title or (f"@{chat.username}" if chat.username else key)
+    kind = {"channel": "канал", "supergroup": "группа", "group": "группа"}.get(chat.type, chat.type)
+    if status in ("member", "administrator"):
+        # добавить бота может админ бота или человек с доступом (если включена проверка ключа)
+        if who.id not in ADMIN_IDS and (is_banned(who.id) or not has_access(who.id)):
+            try:
+                await bot.leave_chat(chat.id)
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось выйти из чата %s", chat.id)
+            for admin in ADMIN_IDS:
+                await _safe_send(bot, admin, f"⛔ {who.full_name} ({who.id}) без доступа добавил бота в {kind} «{title}» ({chat.id}). Бот вышел.")
+            return
+        new = key not in DATA["groups"]
+        DATA["groups"][key] = {"title": title, "type": chat.type, "added_by": who.id}
+        save_data()
+        if new:
+            note = "" if status == "administrator" or chat.type != "channel" else \
+                "\n⚠️ В канале бот должен быть администратором с правом «Публикация сообщений»."
+            for admin in ADMIN_IDS:
+                await _safe_send(bot, admin, f"✅ Бот добавлен: {kind} «{title}» ({chat.id}). Буду присылать туда только замены.{note}")
+    elif status in ("left", "kicked"):
+        if DATA["groups"].pop(key, None) is not None:
+            save_data()
+            for admin in ADMIN_IDS:
+                await _safe_send(bot, admin, f"➖ Бот удалён из чата «{title}» ({chat.id}), уведомления туда больше не шлю.")
+
+
+async def broadcast_groups(bot, text: str):
+    """Отправляет уведомление о заменах во все группы и каналы (без кнопок, ничего больше)."""
+    for key in list(DATA["groups"]):
+        cid = int(key)
+        try:
+            await bot.send_message(cid, text[:4000])
+        except ChatMigrated as e:  # группа стала супергруппой: у неё новый id
+            g = DATA["groups"].pop(key, None)
+            if g is not None:
+                DATA["groups"][str(e.new_chat_id)] = g
+                save_data()
+            try:
+                await bot.send_message(e.new_chat_id, text[:4000])
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось отправить замены в чат %s", e.new_chat_id)
+        except Forbidden:  # бота выгнали или запретили писать
+            log.warning("нет доступа к чату %s, убираю его из списка", cid)
+            DATA["groups"].pop(key, None)
+            save_data()
+        except BadRequest as e:
+            log.warning("не удалось отправить замены в чат %s: %s", cid, e)
+            if "chat not found" in str(e).lower():
+                DATA["groups"].pop(key, None)
+                save_data()
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить замены в чат %s", cid)
+        await asyncio.sleep(0.05)
+
+
 async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     """Смотрит, не появился ли/не изменился ли файл на завтра.
     Пн-сб с 8:00 до 16:00 - каждую минуту, в остальное время - раз в 5 минут."""
@@ -2139,7 +2220,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     if time.monotonic() - _last_check < gap - 5:  # -5 сек запас на дрожание таймера
         return
     _last_check = time.monotonic()
-    if not DATA["subs"]:
+    if not DATA["subs"] and not DATA["groups"]:
         return
     day = next_workday(datetime.now(TZ).date())
     try:
@@ -2159,6 +2240,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     save_data()
     head = "🔔 Файл с заменами обновили!" if updated else "🔔 Выложили замены на завтра!"
     await broadcast(context.bot, f"{head}\n\n{text}")
+    await broadcast_groups(context.bot, f"{head}\n\n{text}")
 
 
 def due_list(now: datetime, kind: str) -> list:
@@ -2866,6 +2948,7 @@ def main():
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS пуст: никто не сможет создавать ключи и пользоваться админ-командами")
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app.add_handler(TypeHandler(Update, chat_gate), group=-3)         # группы и каналы: бот молчит, только шлёт замены
     app.add_handler(MessageHandler(filters.ALL, antispam), group=-2)  # проверка на спам идёт первой
     app.add_handler(TypeHandler(Update, access_gate), group=-1)        # потом проверка ключа доступа
     app.add_handler(CommandHandler("start", start))
@@ -2920,6 +3003,8 @@ def main():
         port=int(os.environ.get("PORT", 10000)),
         url_path=BOT_TOKEN,
         webhook_url=f"{os.environ['RENDER_EXTERNAL_URL']}/{BOT_TOKEN}",
+        # как стандартный набор Telegram (my_chat_member в нём есть), но задан явно: так добавление в группы точно доходит
+        allowed_updates=[t for t in Update.ALL_TYPES if t not in ("chat_member", "message_reaction", "message_reaction_count")],
     )
 
 
