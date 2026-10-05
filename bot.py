@@ -344,10 +344,11 @@ def collect_group(rows, code):
 
 
 def fmt(subj, teach, aud):
+    """Пара одной строкой: «Предмет (Препод, каб. 205)». Если кабинет не указан, он не пишется."""
     s = " / ".join(uniq(subj))
-    extra = uniq(teach) + [f"ауд. {a}" for a in uniq(aud)]
+    extra = uniq(teach) + [f"каб. {a}" for a in uniq(aud)]
     if extra:
-        s += f" ({', '.join(extra)})"
+        s = f"{s} ({', '.join(extra)})" if s else ", ".join(extra)
     return s
 
 
@@ -424,22 +425,41 @@ def fmt_new(d, num, rooms):
     if not any(found.values()):
         return fmt(d["ns"], d["nt"], d["na"])
     if len(teach) == 1:
-        extra = [f"{teach[0]}, ауд. {found[teach[0]]}"]
+        extra = [f"{teach[0]}, каб. {found[teach[0]]}"]
     else:
-        extra = [f"{t} — ауд. {found[t]}" if found[t] else t for t in teach]
+        extra = ["; ".join(f"{t} — каб. {found[t]}" if found[t] else t for t in teach)]
     s = " / ".join(uniq(d["ns"]))
     return f"{s} ({', '.join(extra)})"
 
 
-def lessons_to_lines(lessons, rooms=None):
+CANCEL_MARK = "урока не будет"  # по этой фразе build_message понимает, что в замене есть снятый урок
+
+
+def when_phrase(day) -> str:
+    """'завтра' / 'сегодня' / 'в пятницу (09.10)' - как сказать про день замены."""
+    if day is None:
+        return "в этот день"
+    delta = (day - datetime.now(TZ).date()).days
+    if delta == 0:
+        return "сегодня"
+    if delta == 1:
+        return "завтра"
+    acc = ["в понедельник", "во вторник", "в среду", "в четверг", "в пятницу", "в субботу", "в воскресенье"]
+    return f"{acc[day.weekday()]} ({day:%d.%m})"
+
+
+def lessons_to_lines(lessons, rooms=None, day=None):
+    """Шаблон: «• Уроки 1–2: завтра вместо <было> будет <стало>». В скобках - препод и кабинет
+    (кабинета нет в файле - не пишем). Одна и та же функция работает для кнопки «Замены» и для рассылки."""
+    when = when_phrase(day)
     rows = []
     for num in sorted(lessons):
         d = lessons[num]
-        old = fmt(d["os"], d["ot"], d["oa"]) or "—"
-        new = fmt(d["ns"], d["nt"], d["na"]) or "—"
+        old = fmt(d["os"], d["ot"], d["oa"])
+        new = fmt(d["ns"], d["nt"], d["na"])
         if old == new:
             continue  # по факту ничего не изменилось
-        new = fmt_new(d, num, rooms) or "—"  # то же, но с кабинетом из боковой панели
+        new = fmt_new(d, num, rooms)  # то же, но с кабинетом из боковой панели
         if rows and rows[-1][1] == (old, new) and rows[-1][0][-1] == num - 1:
             rows[-1][0].append(num)
         else:
@@ -448,9 +468,14 @@ def lessons_to_lines(lessons, rooms=None):
     for nums, (old, new) in rows:
         label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
         if new.lower().startswith("урок снят"):
-            out.append(f"• {label}: урок снят (было: {old})")
+            was = f" вместо {old}" if old else ""
+            out.append(f"• {label}: {when}{was} {CANCEL_MARK}")
+        elif not old:
+            out.append(f"• {label}: {when} дополнительно будет {new}")
+        elif not new:
+            out.append(f"• {label}: {when} вместо {old} {CANCEL_MARK}")
         else:
-            out.append(f"• {label}: {old} → {new}")
+            out.append(f"• {label}: {when} вместо {old} будет {new}")
     return out
 
 
@@ -471,7 +496,7 @@ def info_hour(lines):
     return None
 
 
-def analyze(pdf_bytes: bytes):
+def analyze(pdf_bytes: bytes, day: date = None):
     """Возвращает (строки замен | None, инфо-час | None, текст для отладки)."""
     changes, info, debug = None, None, []
     group_lessons, rooms, side_raw = None, [], []
@@ -495,7 +520,7 @@ def analyze(pdf_bytes: bytes):
                 group_lessons = lessons
                 debug.append(f"Блок {GROUP_CODE}:\n" + "\n".join(raw))
     if group_lessons is not None:
-        changes = lessons_to_lines(group_lessons, rooms)
+        changes = lessons_to_lines(group_lessons, rooms, day)
     if changes is None:
         debug.append(f"Группа {GROUP_CODE} в таблице не найдена.")
     debug.append(f"Информационный час: {info or 'нет'}")
@@ -1460,7 +1485,7 @@ def build_message(day: date, changes, info, fun_on: bool = False):
     if info:
         body += f"\n\n🕐 Информационный час: {info}"
     if fun_on:
-        if any("урок снят" in l.lower() for l in changes or []):
+        if any(CANCEL_MARK in l for l in changes or []):
             kind = "cancel"
         else:
             kind = "changes" if changes else "none"
@@ -1473,7 +1498,7 @@ def make_reply(day: date, debug: bool = False, fun_on: bool = False) -> str:
     if item is None:
         text = f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже."
         return text + ("\n\n" + fun("notposted", day) if fun_on and not debug else "")
-    changes, info, dbg = analyze(download(item))
+    changes, info, dbg = analyze(download(item), day)
     return dbg if debug else build_message(day, changes, info, fun_on)
 
 
