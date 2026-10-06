@@ -2951,6 +2951,60 @@ async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ключей: {len(DATA['access']['keys'])}.", reply_markup=KEYBOARD)
 
 
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/groups - список групп и каналов, куда добавлен бот (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    if not DATA["groups"]:
+        await update.message.reply_text("Групп и каналов нет. Добавь бота в группу (в канале — админом), он сам запомнит чат.",
+                                        reply_markup=KEYBOARD)
+        return
+    lines = [f"📣 Групп и каналов: {len(DATA['groups'])}", ""]
+    for key, g in DATA["groups"].items():
+        kind = "канал" if g.get("type") == "channel" else "группа"
+        lines.append(f"• {g.get('title') or key} — {kind}, id {key}")
+    lines += ["", "Проверить, что бот может туда писать: /testgroups"]
+    await update.message.reply_text("\n".join(lines)[:4000], reply_markup=KEYBOARD)
+
+
+async def testgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/testgroups - пробует написать в каждую группу/канал и говорит, куда дошло (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    if not DATA["groups"]:
+        await update.message.reply_text("Групп и каналов нет. Список: /groups", reply_markup=KEYBOARD)
+        return
+    await update.message.reply_text(f"Проверяю {len(DATA['groups'])} чат(ов)…")
+    ok, bad = [], []
+    for key, g in list(DATA["groups"].items()):
+        cid, name = int(key), g.get("title") or key
+        try:
+            m = await context.bot.send_message(cid, "✅ Проверка связи: бот может писать в этот чат (сообщение сейчас удалится).")
+            ok.append(name)
+            try:
+                await context.bot.delete_message(cid, m.message_id)
+            except Exception:  # noqa: BLE001
+                pass
+        except ChatMigrated as e:
+            DATA["groups"][str(e.new_chat_id)] = DATA["groups"].pop(key)
+            save_data()
+            bad.append(f"{name} — группа стала супергруппой, id обновлён, запусти проверку ещё раз")
+        except Forbidden:
+            bad.append(f"{name} — бота выгнали или писать запрещено")
+        except BadRequest as e:
+            bad.append(f"{name} — {e}")
+        except Exception as e:  # noqa: BLE001
+            bad.append(f"{name} — ошибка: {e!r}")
+        await asyncio.sleep(0.05)
+    lines = [f"✅ Дошло: {len(ok)}"] + [f"• {n}" for n in ok]
+    if bad:
+        lines += ["", f"❌ Не дошло: {len(bad)}"] + [f"• {b}" for b in bad]
+        lines += ["", "Если бота выгнали, добавь его заново. В канале нужен админ с правом «Публикация сообщений»."]
+    await update.message.reply_text("\n".join(lines)[:4000], reply_markup=KEYBOARD)
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой id: {update.effective_user.id}\nId чата: {update.effective_chat.id}")
 
@@ -3045,6 +3099,8 @@ def main():
     app.add_handler(CommandHandler("mykey", mykey_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("groups", groups_cmd))
+    app.add_handler(CommandHandler("testgroups", testgroups_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(notif_cb, pattern=r"^ntf:"))
