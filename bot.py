@@ -1631,6 +1631,19 @@ async def zameny(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     day = day or next_workday(today)
     debug = text.lower().lstrip().startswith("debug")
+    if not debug:  # вместо текста присылаем фото файла с заменами (как в группах)
+        try:
+            imgs = await asyncio.to_thread(make_photos, day)
+            if imgs is None:
+                reply = (f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже.\n\n"
+                         + fun("notposted", day))
+                await update.message.reply_text(reply, reply_markup=KEYBOARD)
+            else:
+                cap = f"📅 Замены на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
+                await _send_photos(context.bot, update.effective_chat.id, imgs, cap)
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось отправить фото замен, отправляю текстом")
     try:
         reply = await asyncio.to_thread(make_reply, day, debug, True)
     except Exception as e:  # noqa: BLE001
@@ -2201,14 +2214,24 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = PHOTO_DPI, limit: int = PHOTO_PAG
     return out
 
 
-async def _send_photos(bot, cid, imgs):
-    """Одна страница - обычное фото, несколько - альбом (Telegram: до 10 в альбоме)."""
+async def _send_photos(bot, cid, imgs, caption=None):
+    """Одна страница - обычное фото, несколько - альбом (Telegram: до 10 в альбоме). caption - подпись к первому фото."""
     for i in range(0, len(imgs), 10):
         chunk = imgs[i:i + 10]
+        cap = caption if i == 0 else None
         if len(chunk) == 1:
-            await bot.send_photo(cid, chunk[0])
+            await bot.send_photo(cid, chunk[0], caption=cap)
         else:
-            await bot.send_media_group(cid, [InputMediaPhoto(b) for b in chunk])
+            await bot.send_media_group(cid, [InputMediaPhoto(b, caption=cap if j == 0 else None)
+                                             for j, b in enumerate(chunk)])
+
+
+def make_photos(day: date):
+    """Фото файла замен на день: список JPEG или None, если файла ещё нет."""
+    item = find_pdf(day)
+    if item is None:
+        return None
+    return pdf_to_images(download(item))
 
 
 async def _send_to_group(bot, cid, text: str, imgs):
@@ -2283,7 +2306,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     DATA["notified"] = {"day": day.isoformat(), "sig": sig}
     save_data()
     head = "🔔 Файл с заменами обновили!" if updated else "🔔 Выложили замены на завтра!"
-    await broadcast(context.bot, f"{head}\n\n{text}")
+    await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»")  # только личка; в группах этой приписки нет
     imgs = []
     if SEND_PHOTO and DATA["groups"]:  # фото нужны только группам и каналам; рендерим, если они есть
         try:
