@@ -44,8 +44,8 @@ from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-                      Update)
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, ReplyKeyboardMarkup,
+                      ReplyKeyboardRemove, Update)
 from telegram.error import BadRequest, ChatMigrated, Forbidden
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, TypeHandler, filters)
@@ -2181,19 +2181,61 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _safe_send(bot, admin, f"➖ Бот удалён из чата «{title}» ({chat.id}), уведомления туда больше не шлю.")
 
 
-async def broadcast_groups(bot, text: str):
-    """Отправляет уведомление о заменах во все группы и каналы (без кнопок, ничего больше)."""
+PHOTO_DPI = int(os.environ.get("PHOTO_DPI", "150"))      # чёткость картинки (150 - читаемо на телефоне)
+PHOTO_PAGES = int(os.environ.get("PHOTO_PAGES", "10"))   # максимум страниц PDF, которые превращаем в фото
+SEND_PHOTO = os.environ.get("SEND_PHOTO", "1").lower() not in ("0", "false", "off", "no")  # 0 - выключить фото
+
+
+def pdf_to_images(pdf_bytes: bytes, dpi: int = PHOTO_DPI, limit: int = PHOTO_PAGES) -> list:
+    """Каждая страница PDF -> JPEG (байты). Целый файл, без обрезки."""
+    out = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages[:limit]:
+            img = page.to_image(resolution=dpi).original.convert("RGB")
+            if img.width + img.height > 9500:  # лимит Telegram: сумма сторон фото <= 10000 px
+                k = 9500 / (img.width + img.height)
+                img = img.resize((int(img.width * k), int(img.height * k)))
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=88)
+            out.append(buf.getvalue())
+    return out
+
+
+async def _send_photos(bot, cid, imgs):
+    """Одна страница - обычное фото, несколько - альбом (Telegram: до 10 в альбоме)."""
+    for i in range(0, len(imgs), 10):
+        chunk = imgs[i:i + 10]
+        if len(chunk) == 1:
+            await bot.send_photo(cid, chunk[0])
+        else:
+            await bot.send_media_group(cid, [InputMediaPhoto(b) for b in chunk])
+
+
+async def _send_to_group(bot, cid, text: str, imgs):
+    """Текст замен, а следом фото файла. Если фото не ушло, текст всё равно уже доставлен."""
+    await bot.send_message(cid, text[:4000])
+    if imgs:
+        try:
+            await _send_photos(bot, cid, imgs)
+        except (Forbidden, ChatMigrated):
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить фото замен в чат %s", cid)
+
+
+async def broadcast_groups(bot, text: str, imgs=None):
+    """Отправляет уведомление о заменах во все группы и каналы: тот же текст + фото файла (без кнопок, ничего больше)."""
     for key in list(DATA["groups"]):
         cid = int(key)
         try:
-            await bot.send_message(cid, text[:4000])
+            await _send_to_group(bot, cid, text, imgs)
         except ChatMigrated as e:  # группа стала супергруппой: у неё новый id
             g = DATA["groups"].pop(key, None)
             if g is not None:
                 DATA["groups"][str(e.new_chat_id)] = g
                 save_data()
             try:
-                await bot.send_message(e.new_chat_id, text[:4000])
+                await _send_to_group(bot, e.new_chat_id, text, imgs)
             except Exception:  # noqa: BLE001
                 log.exception("не удалось отправить замены в чат %s", e.new_chat_id)
         except Forbidden:  # бота выгнали или запретили писать
@@ -2232,7 +2274,9 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
         if seen.get("day") == day.isoformat() and seen.get("sig") == sig:
             return  # про этот файл уже писали
         updated = seen.get("day") == day.isoformat()
-        text = await asyncio.to_thread(make_reply, day)
+        pdf = await asyncio.to_thread(download, item)  # PDF качаем один раз: и для текста, и для фото
+        changes, info, _ = await asyncio.to_thread(analyze, pdf, day)
+        text = build_message(day, changes, info)  # то же самое, что отдавал make_reply(day)
     except Exception:  # noqa: BLE001
         log.exception("ошибка проверки Яндекс Диска")
         return  # попробуем в следующий раз
@@ -2240,7 +2284,13 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     save_data()
     head = "🔔 Файл с заменами обновили!" if updated else "🔔 Выложили замены на завтра!"
     await broadcast(context.bot, f"{head}\n\n{text}")
-    await broadcast_groups(context.bot, f"{head}\n\n{text}")
+    imgs = []
+    if SEND_PHOTO and DATA["groups"]:  # фото нужны только группам и каналам; рендерим, если они есть
+        try:
+            imgs = await asyncio.to_thread(pdf_to_images, pdf)
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось сделать фото из PDF, отправлю только текст")
+    await broadcast_groups(context.bot, f"{head}\n\n{text}", imgs)
 
 
 def due_list(now: datetime, kind: str) -> list:
