@@ -1492,7 +1492,7 @@ def build_message(day: date, changes, info, fun_on: bool = False):
     head = f"📅 Замены на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
     body = "\n".join(changes) if changes else "По расписанию"
     if info:
-        body += f"\n\n🕐 Информационный час: {info}"
+        body += "\n\n🕐 Информационный час"
     if fun_on:
         if any(CANCEL_MARK in l for l in changes or []):
             kind = "cancel"
@@ -1577,7 +1577,7 @@ def make_schedule_reply(day: date, fun_on: bool = False) -> str:
             "Замен нет, всё по расписанию.", "Замен нет — живём по плану 👌",
             "Всё по расписанию, сюрпризов нет.", "Замен нет. Редкая удача, пользуйся 😄"])
     if info:
-        body += f"\n\n🕐 Информационный час: {info}"
+        body += "\n\n🕐 Информационный час"
     if fun_on:
         if not lines:
             kind = "noclasses"
