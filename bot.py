@@ -289,7 +289,9 @@ def group_lines(words, tol=2):
 
 
 def page_lines(page):
-    words = page.extract_words(x_tolerance=1.5)
+    # y_tolerance мал специально: строки таблицы идут через ~5 pt, а текст боковой панели стоит между ними.
+    # При стандартных 3 pt pdfplumber склеивал их в одну «строку», блок группы ломался и бот писал «По расписанию».
+    words = page.extract_words(x_tolerance=1.5, y_tolerance=0.5)
     return [" ".join(w["text"] for w in ws) for _, ws in group_lines(words)]
 
 
@@ -489,6 +491,11 @@ def info_hour(lines):
     for l in lines[start + 1:]:
         if "у остальных" in l.lower():
             break
+        m = re.match(rf"^\s*{re.escape(GROUP_NAME)}\s+(.+?)\s*$", l) if not seg else None
+        if m:  # формат «01-24 ТЭПА 218» -> «ТЭПА, каб. 218»
+            what = m.group(1)
+            m2 = re.match(r"^(.+?)\s+(\d+\w*)$", what)
+            return f"{m2.group(1)}, каб. {m2.group(2)}" if m2 else what
         seg = (seg + " " + l).strip()
         if not seg.endswith((",", "-", "–")):
             parts = re.split(r"\s[-–—]\s", seg)
@@ -2130,8 +2137,9 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(SUB_OFF, reply_markup=KEYBOARD)
 
 
-async def broadcast(bot, text: str, ids=None):
-    """Рассылка: по умолчанию тем, у кого включены замены; можно передать свой список id."""
+async def broadcast(bot, text: str, ids=None, imgs=None):
+    """Рассылка: по умолчанию тем, у кого включены замены; можно передать свой список id.
+    imgs - JPEG-страницы файла замен: если есть, фото уходит следом, ниже текста."""
     for cid in list(DATA["subs"] if ids is None else ids):
         if is_banned(cid) or not has_access(cid):  # в личке id чата = id пользователя
             continue
@@ -2139,8 +2147,15 @@ async def broadcast(bot, text: str, ids=None):
             await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
         except (Forbidden, BadRequest):  # бота заблокировали / чата нет
             set_sub(cid, False)
+            continue
         except Exception:  # noqa: BLE001
             log.exception("не удалось отправить уведомление %s", cid)
+            continue
+        if imgs:  # текст уже доставлен; если фото не ушло, подписчика не отключаем
+            try:
+                await _send_photos(bot, cid, imgs)
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось отправить фото замен %s", cid)
         await asyncio.sleep(0.05)
 
 
@@ -2306,13 +2321,13 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     DATA["notified"] = {"day": day.isoformat(), "sig": sig}
     save_data()
     head = "🔔 Файл с заменами обновили!" if updated else "🔔 Выложили замены на завтра!"
-    await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»")  # только личка; в группах этой приписки нет
     imgs = []
-    if SEND_PHOTO and DATA["groups"]:  # фото нужны только группам и каналам; рендерим, если они есть
+    if SEND_PHOTO and (DATA["subs"] or DATA["groups"]):  # фото идёт под текстом и в личку, и в группы
         try:
             imgs = await asyncio.to_thread(pdf_to_images, pdf)
         except Exception:  # noqa: BLE001
             log.exception("не получилось сделать фото из PDF, отправлю только текст")
+    await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»", imgs=imgs)  # личка; в группах этой приписки нет
     await broadcast_groups(context.bot, f"{head}\n\n{text}", imgs)
 
 
