@@ -2318,9 +2318,15 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:  # noqa: BLE001
         log.exception("ошибка проверки Яндекс Диска")
         return  # попробуем в следующий раз
-    DATA["notified"] = {"day": day.isoformat(), "sig": sig}
+    if updated and seen.get("text") == text:
+        # файл перезалили, но замены для группы те же: запоминаем новую версию и молчим
+        DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": text}
+        save_data()
+        log.info("файл на %s обновили, но замены не изменились - не рассылаю", day)
+        return
+    DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": text}
     save_data()
-    head = "🔔 Файл с заменами обновили!" if updated else "🔔 Выложили замены на завтра!"
+    head = "🔔 Замены обновили!" if updated else "🔔 Выложили замены на завтра!"
     imgs = []
     if SEND_PHOTO and (DATA["subs"] or DATA["groups"]):  # фото идёт под текстом и в личку, и в группы
         try:
