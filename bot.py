@@ -2167,6 +2167,29 @@ async def broadcast(bot, text: str, ids=None, imgs=None):
         await asyncio.sleep(0.05)
 
 
+HINT_TEXT = "Есть замены"
+
+
+def non_subscribers() -> list:
+    """Личные чаты людей, которые пользовались ботом, но выключили уведомления о заменах."""
+    known = {int(k) for k in list(DATA["stats"]["users"]) + list(DATA["prefs"]) if k.lstrip("-").isdigit()}
+    return sorted(c for c in known if c > 0 and c not in set(DATA["subs"]))
+
+
+async def broadcast_hint(bot, text: str = HINT_TEXT):
+    """Тем, у кого уведомления о заменах выключены, - только короткое «Есть замены» (без фото и подробностей)."""
+    for cid in non_subscribers():
+        if is_banned(cid) or not has_access(cid):
+            continue
+        try:
+            await bot.send_message(cid, text, reply_markup=KEYBOARD)
+        except (Forbidden, BadRequest):  # бота заблокировали / чата нет: просто пропускаем
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить «%s» %s", text, cid)
+        await asyncio.sleep(0.05)
+
+
 # ---------- Группы и каналы: ТОЛЬКО уведомления о заменах ----------
 # Бота добавляют в группу/канал (в канале - администратором). Там он ничего не отвечает ни на какие
 # сообщения, кнопки и команды: только присылает то же уведомление о заменах, что и в личку.
@@ -2313,7 +2336,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     if time.monotonic() - _last_check < gap - 5:  # -5 сек запас на дрожание таймера
         return
     _last_check = time.monotonic()
-    if not DATA["subs"] and not DATA["groups"]:
+    if not DATA["subs"] and not DATA["groups"] and not non_subscribers():
         return
     day = next_workday(datetime.now(TZ).date())
     try:
@@ -2352,6 +2375,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     else:  # запасной вариант: фото сделать не вышло (или SEND_PHOTO=0), чтобы уведомление не пропало
         await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»")
         await broadcast_groups(context.bot, f"{head}\n\n{text}")
+    await broadcast_hint(context.bot)  # у кого уведомления выключены: только «Есть замены»
 
 
 def due_list(now: datetime, kind: str) -> list:
