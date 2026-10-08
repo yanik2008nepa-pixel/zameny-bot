@@ -2141,21 +2141,27 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(bot, text: str, ids=None, imgs=None):
     """Рассылка: по умолчанию тем, у кого включены замены; можно передать свой список id.
-    imgs - JPEG-страницы файла замен: если есть, фото уходит следом, ниже текста."""
+    imgs - JPEG-страницы файла замен: если есть, фото уходит следом, ниже текста.
+    Если text пустой (None или ""), отправляются только фото, без текста."""
     for cid in list(DATA["subs"] if ids is None else ids):
         if is_banned(cid) or not has_access(cid):  # в личке id чата = id пользователя
             continue
-        try:
-            await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
-        except (Forbidden, BadRequest):  # бота заблокировали / чата нет
-            set_sub(cid, False)
-            continue
-        except Exception:  # noqa: BLE001
-            log.exception("не удалось отправить уведомление %s", cid)
-            continue
-        if imgs:  # текст уже доставлен; если фото не ушло, подписчика не отключаем
+        if text:
+            try:
+                await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
+            except (Forbidden, BadRequest):  # бота заблокировали / чата нет
+                set_sub(cid, False)
+                continue
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось отправить уведомление %s", cid)
+                continue
+        if imgs:  # если есть текст, он уже доставлен; если фото не ушло, подписчика не отключаем
             try:
                 await _send_photos(bot, cid, imgs)
+            except (Forbidden, BadRequest) as e:
+                if not text:  # режим «только фото»: так мы узнаём, что бота заблокировали
+                    set_sub(cid, False)
+                log.warning("не удалось отправить фото замен %s: %s", cid, e)
             except Exception:  # noqa: BLE001
                 log.exception("не удалось отправить фото замен %s", cid)
         await asyncio.sleep(0.05)
@@ -2252,7 +2258,12 @@ def make_photos(day: date):
 
 
 async def _send_to_group(bot, cid, text: str, imgs):
-    """Текст замен, а следом фото файла. Если фото не ушло, текст всё равно уже доставлен."""
+    """Текст замен, а следом фото файла. Если фото не ушло, текст всё равно уже доставлен.
+    Если text пустой, шлём только фото (ошибки уходят вызывающему, он убирает недоступные чаты)."""
+    if not text:
+        if imgs:
+            await _send_photos(bot, cid, imgs)
+        return
     await bot.send_message(cid, text[:4000])
     if imgs:
         try:
@@ -2330,13 +2341,17 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     save_data()
     head = "🔔 Замены обновили!" if updated else "🔔 Выложили замены на завтра!"
     imgs = []
-    if SEND_PHOTO and (DATA["subs"] or DATA["groups"]):  # фото идёт под текстом и в личку, и в группы
+    if SEND_PHOTO and (DATA["subs"] or DATA["groups"]):  # рассылка идёт фото, и в личку, и в группы
         try:
             imgs = await asyncio.to_thread(pdf_to_images, pdf)
         except Exception:  # noqa: BLE001
             log.exception("не получилось сделать фото из PDF, отправлю только текст")
-    await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»", imgs=imgs)  # личка; в группах этой приписки нет
-    await broadcast_groups(context.bot, f"{head}\n\n{text}", imgs)
+    if imgs:  # рассылка (личка и группы): только фото файла, без текста
+        await broadcast(context.bot, None, imgs=imgs)
+        await broadcast_groups(context.bot, None, imgs)
+    else:  # запасной вариант: фото сделать не вышло (или SEND_PHOTO=0), чтобы уведомление не пропало
+        await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»")
+        await broadcast_groups(context.bot, f"{head}\n\n{text}")
 
 
 def due_list(now: datetime, kind: str) -> list:
