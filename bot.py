@@ -249,10 +249,12 @@ def list_items():
 
 
 def find_pdf(day: date):
-    keys = (day.strftime("%d.%m.%Y"), day.strftime("%d.%m.%y"))
+    # Год в названии файла игнорируем (иногда пишут не тот год, например 2029): ищем только день и месяц.
+    # Список идёт от новых файлов к старым, поэтому при совпадении берётся самый свежий.
+    pat = re.compile(rf"(?<!\d)0?{day.day}\.0?{day.month}(?!\d)")
     for it in list_items():
         name = it["name"].lower()
-        if name.endswith(".pdf") and any(k in name for k in keys):
+        if name.endswith(".pdf") and pat.search(name):
             return it
     return None
 
