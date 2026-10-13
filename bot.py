@@ -2294,6 +2294,8 @@ async def broadcast_hint(bot, text: str = HINT_TEXT):
 async def chat_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Самый первый обработчик: всё, что пришло из группы/канала, дальше не идёт (бот молчит).
     Исключение - добавление/удаление бота из чата: запоминаем или забываем чат."""
+    if update.edited_message or update.edited_channel_post:
+        raise ApplicationHandlerStop  # правки старых сообщений бот игнорирует (обработчики ждут update.message)
     chat = update.effective_chat
     if chat is None or chat.type == "private":
         return  # личка работает как раньше
@@ -3357,7 +3359,8 @@ def main():
         url_path=BOT_TOKEN,
         webhook_url=f"{os.environ['RENDER_EXTERNAL_URL']}/{BOT_TOKEN}",
         # как стандартный набор Telegram (my_chat_member в нём есть), но задан явно: так добавление в группы точно доходит
-        allowed_updates=[t for t in Update.ALL_TYPES if t not in ("chat_member", "message_reaction", "message_reaction_count")],
+        allowed_updates=[t for t in Update.ALL_TYPES if t not in ("chat_member", "message_reaction", "message_reaction_count",
+                                                       "edited_message", "edited_channel_post")],
     )
 
 
