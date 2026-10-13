@@ -23,6 +23,7 @@
   /access on|off    - включить/выключить проверку ключа (on all - сбросить доступ даже у тех, кто вводил ключ)
   /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
   /unbankey [кол-во] - ключ разбана: снимает бан, блокировку за частый спам или мут (только для ADMIN_IDS)
+  /broadcast on|off - включить/выключить рассылку замен в личку и в группы (по умолчанию выключена) (только для ADMIN_IDS)
   /mykey            - свой статус доступа
 Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
   debug             - как бот разобрал файл (для проверки)
@@ -37,9 +38,11 @@ import re
 import secrets
 import threading
 import time
+from html.parser import HTMLParser
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
+from urllib.parse import unquote, urljoin
 from zoneinfo import ZoneInfo
 
 import pdfplumber
@@ -52,6 +55,8 @@ from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHand
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
+SITE_URL = os.environ.get("SITE_URL", "https://kso.minsk.edu.by/ru/main.aspx?guid=1321").strip()  # сайт колледжа, раздел «Замены»; пусто = не использовать
+SITE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; zameny-bot)"}
 GROUP_NAME = os.environ.get("GROUP_NAME", "01-24")  # как в блоке "Информационный час"
 GROUP_CODE = os.environ.get("GROUP_CODE", "124")    # как в первой колонке таблицы
 
@@ -119,6 +124,7 @@ def fix_data(d):
     d.setdefault("prefs", {})  # chat_id -> {"morning"/"time"/"last": расписание на день, "evening"/"etime"/"elast": расписание на завтра}
     d.setdefault("stats", {"users": {}, "days": {}})
     d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
+    d.setdefault("broadcast", {"on": False})  # рассылка замен (личка + группы): выключена, пока админ не включит
     acc = d.setdefault("access", {})
     acc.setdefault("required", ACCESS_REQUIRED)  # нужен ли ключ доступа
     acc.setdefault("allowed", {})                # id -> {"until": конец доступа (0 = навсегда), "granted", "warned"}
@@ -248,18 +254,108 @@ def list_items():
     return data.get("_embedded", {}).get("items", [])
 
 
-def find_pdf(day: date):
-    # Год в названии файла игнорируем (иногда пишут не тот год, например 2029): ищем только день и месяц.
-    # Список идёт от новых файлов к старым, поэтому при совпадении берётся самый свежий.
-    pat = re.compile(rf"(?<!\d)0?{day.day}\.0?{day.month}(?!\d)")
-    for it in list_items():
-        name = it["name"].lower()
-        if name.endswith(".pdf") and pat.search(name):
-            return it
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+              "сентября", "октября", "ноября", "декабря"]
+
+
+def date_pattern(day: date):
+    """05.10, 5.10.2026, «5 октября» - год игнорируем (иногда пишут не тот)."""
+    return re.compile(rf"(?<!\d)0?{day.day}\s*\.\s*0?{day.month}(?!\d)"
+                      rf"|(?<!\d)0?{day.day}\s+{MONTHS_GEN[day.month - 1]}", re.I)
+
+
+class _LinkParser(HTMLParser):
+    """Собирает все ссылки страницы: (href, текст ссылки)."""
+
+    def __init__(self):
+        super().__init__()
+        self.links, self._href, self._text = [], None, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href, self._text = dict(attrs).get("href"), []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, " ".join("".join(self._text).split())))
+            self._href = None
+
+
+def site_items(day: date):
+    """PDF-файлы замен с сайта колледжа, в названии или тексте ссылки которых есть дата дня.
+    Вкладки на странице (#tabs-2) - это один и тот же HTML, поэтому ищем по всей странице."""
+    if not SITE_URL:
+        return []
+    r = requests.get(SITE_URL, timeout=30, headers=SITE_HEADERS)
+    r.raise_for_status()
+    if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
+        r.encoding = r.apparent_encoding
+    parser = _LinkParser()
+    parser.feed(r.text)
+    pat, out, seen = date_pattern(day), [], set()
+    for href, text in parser.links:
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        url = urljoin(r.url, href)
+        name = unquote(url.rsplit("/", 1)[-1].split("?")[0])
+        if url in seen or not pat.search(f"{text} {name} {unquote(url)}"):
+            continue
+        if not (".pdf" in url.lower() or "pdf" in text.lower() or "file" in url.lower() or "download" in url.lower()):
+            continue  # ссылка с датой, но не похожая на файл (например, новость)
+        seen.add(url)
+        out.append({"name": (text or name) + ("" if (text or name).lower().endswith(".pdf") else ".pdf"),
+                    "site_url": url})
+    return out
+
+
+def site_find(day: date):
+    for it in site_items(day):
+        try:  # «подпись» версии файла, чтобы заметить, что файл перезалили
+            h = requests.head(it["site_url"], timeout=20, allow_redirects=True, headers=SITE_HEADERS)
+            it["modified"] = "|".join(h.headers.get(k, "") for k in ("ETag", "Last-Modified", "Content-Length"))
+        except Exception:  # noqa: BLE001
+            pass
+        return it
     return None
 
 
+def find_pdf(day: date):
+    """Сначала Яндекс Диск, если там нет (или он недоступен) - сайт колледжа."""
+    # Год в названии файла игнорируем (иногда пишут не тот год, например 2029): ищем только день и месяц.
+    # Список идёт от новых файлов к старым, поэтому при совпадении берётся самый свежий.
+    pat = re.compile(rf"(?<!\d)0?{day.day}\.0?{day.month}(?!\d)")
+    disk_err = None
+    try:
+        for it in list_items():
+            name = it["name"].lower()
+            if name.endswith(".pdf") and pat.search(name):
+                return it
+    except Exception as e:  # noqa: BLE001
+        disk_err = e
+        log.warning("Яндекс Диск недоступен: %r", e)
+    try:
+        it = site_find(day)
+    except Exception:  # noqa: BLE001
+        log.exception("не удалось проверить сайт колледжа")
+        if disk_err:
+            raise disk_err
+        return None
+    if it:
+        log.info("замены на %s найдены на сайте: %s", day, it["site_url"])
+    return it
+
+
 def download(item) -> bytes:
+    if item.get("site_url"):
+        r = requests.get(item["site_url"], timeout=60, headers=SITE_HEADERS)
+        r.raise_for_status()
+        if not r.content.lstrip()[:5].startswith(b"%PDF"):
+            raise ValueError("По ссылке с сайта пришёл не PDF: " + item["site_url"])
+        return r.content
     url = item.get("file")
     if not url:
         params = {"public_key": DISK_URL}
@@ -2336,7 +2432,8 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     if time.monotonic() - _last_check < gap - 5:  # -5 сек запас на дрожание таймера
         return
     _last_check = time.monotonic()
-    if not DATA["subs"] and not DATA["groups"] and not non_subscribers():
+    on = DATA["broadcast"]["on"]
+    if on and not DATA["subs"] and not DATA["groups"] and not non_subscribers():
         return
     day = next_workday(datetime.now(TZ).date())
     try:
@@ -2354,6 +2451,11 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:  # noqa: BLE001
         log.exception("ошибка проверки Яндекс Диска")
         return  # попробуем в следующий раз
+    if not on:  # рассылка выключена: тихо запоминаем файл как «уже известный», ничего не шлём
+        DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": text}
+        save_data()
+        log.info("рассылка выключена: файл на %s записан без уведомлений", day)
+        return
     if updated and seen.get("text") == text:
         # файл перезалили, но замены для группы те же: запоминаем новую версию и молчим
         DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": text}
@@ -2881,6 +2983,56 @@ async def mykey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=KEYBOARD)
 
 
+# ---------- Рассылка замен: включает и выключает админ ----------
+# Выключена: бот всё так же проверяет файл, но тихо запоминает его и никому ничего не шлёт
+# (ни текст, ни фото, ни «Есть замены»). После включения придут только следующие новые или обновлённые замены.
+# Кнопки «Замены», «Пары» и расписание на день/завтра работают независимо от этого переключателя.
+
+def sync_notified():
+    """Запоминает текущий файл на завтра как уже известный (без рассылки)."""
+    day = next_workday(datetime.now(TZ).date())
+    item = find_pdf(day)
+    if item is None:
+        return
+    sig = item.get("md5") or item.get("modified") or item["name"]
+    changes, info, _ = analyze(download(item), day)
+    DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": build_message(day, changes, info)}
+
+
+async def set_broadcast(on: bool) -> str:
+    DATA["broadcast"]["on"] = on
+    note = ""
+    if on:
+        try:  # чтобы уже выложенные замены не разослались сразу после включения
+            await asyncio.to_thread(sync_notified)
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось запомнить текущий файл при включении рассылки")
+            note = "\n⚠️ Не смог проверить текущий файл: если замены на завтра уже выложены, они могут разослаться."
+    save_data()
+    if on:
+        return ("📢 Рассылка замен ВКЛЮЧЕНА (личка и группы). Уже выложенные замены не разошлю, "
+                "только следующие новые или обновлённые." + note)
+    return "🔇 Рассылка замен ВЫКЛЮЧЕНА. Бот проверяет файл, но молчит: ни текста, ни фото, ни «Есть замены»."
+
+
+def broadcast_state() -> str:
+    return "включена 📢" if DATA["broadcast"]["on"] else "выключена 🔇"
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast on|off - включить/выключить рассылку замен (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if not args or args[0] not in ("on", "off", "вкл", "выкл"):
+        await update.message.reply_text(
+            f"Рассылка замен сейчас: {broadcast_state()}.\n\n/broadcast on — включить\n/broadcast off — выключить\n"
+            "Или кнопка в /admin.", reply_markup=KEYBOARD)
+        return
+    await update.message.reply_text(await set_broadcast(args[0] in ("on", "вкл")), reply_markup=KEYBOARD)
+
+
 # ---------- Панель админа (кнопки) ----------
 
 def admin_markup() -> InlineKeyboardMarkup:
@@ -2892,6 +3044,7 @@ def admin_markup() -> InlineKeyboardMarkup:
         [B("🎁 Выдать доступ всем", callback_data="adm:ga")],
         [B("📋 Ключи", callback_data="adm:keys"), B("👥 Пользователи", callback_data="adm:users")],
         [B("🔓 Выключить проверку ключа" if on else "🔒 Включить проверку ключа", callback_data="adm:toggle")],
+        [B("🔇 Выключить рассылку замен" if DATA["broadcast"]["on"] else "📢 Включить рассылку замен", callback_data="adm:bc")],
     ])
 
 
@@ -2903,6 +3056,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     on = DATA["access"]["required"]
     await update.message.reply_text(
         f"🛠 Панель администратора\nПроверка ключа: {'включена 🔒' if on else 'выключена 🔓'}\n"
+        f"Рассылка замен: {broadcast_state()}\n"
         f"Сохранение данных: {'авто в GitHub Gist ✅' if _gist_ready else 'только диск ⚠️ (Render может стереть)'}\n\n"
         "Кнопки «🔑» создают одноразовый ключ. Сразу несколько: /key 7d 10",
         reply_markup=admin_markup())
@@ -2948,6 +3102,13 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(grant_report(todo, already, banned, dur))
         if notify:
             await notify_granted(context.bot, todo, dur)
+    elif action == "bc":
+        text = await set_broadcast(not DATA["broadcast"]["on"])
+        try:
+            await q.message.edit_reply_markup(reply_markup=admin_markup())
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id, text)
     elif action == "toggle":
         text = set_access(not DATA["access"]["required"])
         try:
@@ -3161,6 +3322,7 @@ def main():
     app.add_handler(CommandHandler("mykey", mykey_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("groups", groups_cmd))
     app.add_handler(CommandHandler("testgroups", testgroups_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
