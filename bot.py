@@ -25,6 +25,7 @@
   /unbankey [кол-во] - ключ разбана: снимает бан, блокировку за частый спам или мут (только для ADMIN_IDS)
   /broadcast on|off - включить/выключить рассылку замен в личку и в группы (по умолчанию выключена) (только для ADMIN_IDS)
   /site [дата]      - что бот видит на сайте колледжа: ссылки и найденные файлы замен (диагностика) (только для ADMIN_IDS)
+  /setfile ссылка   - добавить ссылку на файл/папку Google Диска как источник замен; /clearfiles - убрать (только для ADMIN_IDS)
   /mykey            - свой статус доступа
 Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
   debug             - как бот разобрал файл (для проверки)
@@ -128,6 +129,7 @@ def fix_data(d):
     d.setdefault("prefs", {})  # chat_id -> {"morning"/"time"/"last": расписание на день, "evening"/"etime"/"elast": расписание на завтра}
     d.setdefault("stats", {"users": {}, "days": {}})
     d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
+    d.setdefault("extra_urls", [])  # ссылки на файлы/папки Google Диска, добавленные админом командой /setfile
     d.setdefault("broadcast", {"on": False})  # рассылка замен (личка + группы): выключена, пока админ не включит
     acc = d.setdefault("access", {})
     acc.setdefault("required", ACCESS_REQUIRED)  # нужен ли ключ доступа
@@ -293,15 +295,20 @@ DRIVE_FILE = re.compile(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\"'#]
 DRIVE_FOLDER = re.compile(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders/|embeddedfolderview\?id=|folderview\?id=)([\w-]+)")
 
 
-_site_down_until = [0.0]   # если сайт не отвечает, пару минут не мучаем его и пользователей ожиданием
+_page_down = {}            # адрес -> до какого времени не пробуем (если не отвечал), чтобы не вешать бота ожиданием
 _drive_titles = {}         # id файла на Google Диске -> (когда узнали, имя файла)
+
+
+def all_site_urls() -> list:
+    """Страницы сайта из SITE_URL + ссылки на Google Диск, добавленные админом командой /setfile."""
+    return SITE_URLS + [u for u in DATA["extra_urls"] if u not in SITE_URLS]
 
 
 def fetch_html(url: str):
     last = None
     for _ in range(2):
         try:
-            r = requests.get(url, timeout=(8, 25), headers=SITE_HEADERS)
+            r = requests.get(url, timeout=(8, 20), headers=SITE_HEADERS)
             r.raise_for_status()
             if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
                 r.encoding = r.apparent_encoding
@@ -364,15 +371,16 @@ def drive_download_url(url: str):
 def site_items(day: date):
     """PDF-файлы замен (с сайта колледжа или напрямую с Google Диска), у которых дата дня есть в
     ссылке или в имени файла. Для файла на Диске без даты в ссылке имя берём со страницы Диска."""
-    if time.time() < _site_down_until[0]:
-        return []
     pat, out, seen, last_err, ok, lookups = date_pattern(day), [], set(), None, False, 0
-    for page in SITE_URLS:
+    for page in all_site_urls():
+        if time.time() < _page_down.get(page, 0):
+            continue  # недавно не отвечал
         try:
             _, _, links, _ = page_links(page)
             ok = True
         except Exception as e:  # noqa: BLE001
             last_err = e
+            _page_down[page] = time.time() + 180
             log.warning("сайт %s недоступен: %r", page, e)
             continue
         for url, text in links:
@@ -397,18 +405,17 @@ def site_items(day: date):
             out.append({"name": title + ("" if title.lower().endswith(".pdf") else ".pdf"),
                         "site_url": dl or url})
     if not ok and last_err:
-        _site_down_until[0] = time.time() + 120
         raise last_err
     return out
 
 
 def site_debug(day: date) -> str:
     """Диагностика: что бот видит на страницах сайта и какие файлы считает заменами."""
-    if not SITE_URLS:
-        return "SITE_URL пуст: сайт отключён."
-    _site_down_until[0] = 0
+    if not all_site_urls():
+        return "SITE_URL пуст и ссылок на Диск нет: источник отключён."
+    _page_down.clear()
     pat, out = date_pattern(day), [f"Ищу дату: {day:%d.%m.%Y}"]
-    for page in SITE_URLS:
+    for page in all_site_urls():
         out += ["", f"Адрес: {page}"]
         try:
             final, html, links, folders = page_links(page)
@@ -448,6 +455,46 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:  # noqa: BLE001
         text = f"❌ Не получилось открыть сайт: {e!r}"
     await update.message.reply_text(text[:4000], reply_markup=KEYBOARD)
+
+
+async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setfile ссылка - добавить ссылку на файл или папку Google Диска как источник замен (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    links = [a for a in (context.args or []) if DRIVE_FILE.search(a) or DRIVE_FOLDER.search(a)]
+    if not links:
+        cur = "\n".join(f"• {u}" for u in DATA["extra_urls"]) or "—"
+        await update.message.reply_text(
+            "Пришли ссылку на файл или папку Google Диска:\n/setfile https://drive.google.com/file/d/…/view\n\n"
+            f"Сейчас добавлено:\n{cur}\n\nОчистить список: /clearfiles. Проверить, что бот видит: /site",
+            reply_markup=KEYBOARD)
+        return
+    for u in links:
+        if u in DATA["extra_urls"]:
+            DATA["extra_urls"].remove(u)
+        DATA["extra_urls"].append(u)
+    del DATA["extra_urls"][:-10]  # храним последние 10
+    _page_down.clear()
+    save_data()
+    lines = []
+    for u in links:
+        m = DRIVE_FILE.search(u)
+        title = (await asyncio.to_thread(drive_title, m.group(1))) if m else ""
+        lines.append(f"• {title or ('папка' if DRIVE_FOLDER.search(u) else 'имя файла не удалось узнать')}")
+    await update.message.reply_text("✅ Добавил источник замен:\n" + "\n".join(lines)
+                                    + "\n\nБот ищет в нём файл с датой в имени (например 14.10.2026.pdf). Проверка: /site",
+                                    reply_markup=KEYBOARD)
+
+
+async def clearfiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clearfiles - убрать ссылки на Google Диск, добавленные через /setfile (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    DATA["extra_urls"] = []
+    save_data()
+    await update.message.reply_text("🗑 Добавленные ссылки на Диск убраны.", reply_markup=KEYBOARD)
 
 
 def site_find(day: date):
@@ -3464,6 +3511,8 @@ def main():
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("site", site_cmd))
+    app.add_handler(CommandHandler("setfile", setfile_cmd))
+    app.add_handler(CommandHandler("clearfiles", clearfiles_cmd))
     app.add_handler(CommandHandler("groups", groups_cmd))
     app.add_handler(CommandHandler("testgroups", testgroups_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
