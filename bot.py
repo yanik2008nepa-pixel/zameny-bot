@@ -45,7 +45,7 @@ from html.parser import HTMLParser
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
-from urllib.parse import unquote, urljoin
+from urllib.parse import quote, unquote, urljoin
 from zoneinfo import ZoneInfo
 
 import pdfplumber
@@ -304,17 +304,32 @@ def all_site_urls() -> list:
     return SITE_URLS + [u for u in DATA["extra_urls"] if u not in SITE_URLS]
 
 
+SITE_PROXY = os.environ.get("SITE_PROXY", "").strip()  # свой посредник для сайта колледжа, адрес с {url}, например https://my.host/fetch?u={url}
+_last_route = [""]
+
+
 def fetch_html(url: str):
+    """Страница по адресу url. Для сайта колледжа, если напрямую не открывается (с зарубежных серверов он
+    часто молчит), пробуем запасные пути: свой посредник SITE_PROXY, затем сервис r.jina.ai."""
+    routes = [("напрямую", url, SITE_HEADERS, (6, 15))]
+    if "google.com" not in url:
+        if SITE_PROXY:
+            routes.append(("свой посредник", SITE_PROXY.replace("{url}", quote(url, safe="")), SITE_HEADERS, (8, 30)))
+        routes.append(("r.jina.ai", "https://r.jina.ai/" + url, {**SITE_HEADERS, "X-Return-Format": "html"}, (8, 30)))
     last = None
-    for _ in range(2):
+    for name, u, headers, tmo in routes:
         try:
-            r = requests.get(url, timeout=(8, 20), headers=SITE_HEADERS)
+            r = requests.get(u, timeout=tmo, headers=headers)
             r.raise_for_status()
             if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
                 r.encoding = r.apparent_encoding
-            return r.url, r.text
-        except requests.RequestException as e:
+            if len(r.text) < 200 and name != "напрямую":
+                raise ValueError("пустой ответ")
+            _last_route[0] = name
+            return (r.url if name == "напрямую" else url), r.text
+        except Exception as e:  # noqa: BLE001
             last = e
+            log.warning("страница %s не открылась (%s): %r", url, name, e)
     raise last
 
 
@@ -423,6 +438,7 @@ def site_debug(day: date) -> str:
             out.append(f"❌ Не получилось открыть: {e!r}")
             continue
         drive = [(h, t) for h, t in links if DRIVE_FILE.search(h)]
+        out += [f"Как открылась: {_last_route[0] or '—'}"] if html else []
         out += [f"Размер: {len(html)} символов, ссылок: {len(links)}, «.pdf» в коде: {html.lower().count('.pdf')}, "
                 f"Google Диск: файлов {len(drive)}, папок {len(folders)}"]
         files = [(h, t) for h, t in links if re.search(r"pdf|file|download|drive\.google", h + t, re.I)]
