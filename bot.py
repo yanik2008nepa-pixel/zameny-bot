@@ -24,6 +24,7 @@
   /backup           - прислать файл с данными; файл с подписью /restore - вернуть данные
   /unbankey [кол-во] - ключ разбана: снимает бан, блокировку за частый спам или мут (только для ADMIN_IDS)
   /broadcast on|off - включить/выключить рассылку замен в личку и в группы (по умолчанию выключена) (только для ADMIN_IDS)
+  /site [дата]      - что бот видит на сайте колледжа: ссылки и найденные файлы замен (диагностика) (только для ADMIN_IDS)
   /mykey            - свой статус доступа
 Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
   debug             - как бот разобрал файл (для проверки)
@@ -56,6 +57,7 @@ from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHand
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
 SITE_URL = os.environ.get("SITE_URL", "https://kso.minsk.edu.by/ru/main.aspx?guid=1321").strip()  # сайт колледжа, раздел «Замены»; пусто = не использовать
+SITE_URLS = [u for u in re.split(r"[\s,]+", SITE_URL) if u]  # можно несколько адресов через запятую или пробел
 SITE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; zameny-bot)"}
 GROUP_NAME = os.environ.get("GROUP_NAME", "01-24")  # как в блоке "Информационный час"
 GROUP_CODE = os.environ.get("GROUP_CODE", "124")    # как в первой колонке таблицы
@@ -285,31 +287,117 @@ class _LinkParser(HTMLParser):
             self._href = None
 
 
-def site_items(day: date):
-    """PDF-файлы замен с сайта колледжа, в названии или тексте ссылки которых есть дата дня.
-    Вкладки на странице (#tabs-2) - это один и тот же HTML, поэтому ищем по всей странице."""
-    if not SITE_URL:
-        return []
-    r = requests.get(SITE_URL, timeout=30, headers=SITE_HEADERS)
+DRIVE_FILE = re.compile(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\"'#]*&)?id=)([\w-]+)")
+DRIVE_FOLDER = re.compile(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders/|embeddedfolderview\?id=|folderview\?id=)([\w-]+)")
+
+
+def fetch_html(url: str):
+    r = requests.get(url, timeout=30, headers=SITE_HEADERS)
     r.raise_for_status()
     if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
         r.encoding = r.apparent_encoding
+    return r.url, r.text
+
+
+def page_links(page_url: str):
+    """Все ссылки страницы (href уже полный, текст) + ссылки из встроенных папок Google Диска.
+    Возвращает (итоговый url, html, ссылки, id папок Диска)."""
+    final, html = fetch_html(page_url)
     parser = _LinkParser()
-    parser.feed(r.text)
-    pat, out, seen = date_pattern(day), [], set()
-    for href, text in parser.links:
-        if not href or href.startswith(("#", "javascript:", "mailto:")):
+    parser.feed(html)
+    links = [(urljoin(final, h), t) for h, t in parser.links
+             if h and not h.startswith(("#", "javascript:", "mailto:"))]
+    folders = sorted(set(DRIVE_FOLDER.findall(html)))
+    for fid in folders:  # папка Google Диска, встроенная или со ссылкой на странице: читаем её список файлов
+        try:
+            _, fh = fetch_html(f"https://drive.google.com/embeddedfolderview?id={fid}#list")
+            fp = _LinkParser()
+            fp.feed(fh)
+            links += [(h, t) for h, t in fp.links if h]
+        except Exception:  # noqa: BLE001
+            log.warning("не удалось прочитать папку Google Диска %s", fid)
+    return final, html, links, folders
+
+
+def drive_download_url(url: str):
+    m = DRIVE_FILE.search(url)
+    return f"https://drive.usercontent.google.com/download?id={m.group(1)}&export=download&confirm=t" if m else None
+
+
+def site_items(day: date):
+    """PDF-файлы замен с сайта колледжа (прямые ссылки или Google Диск), в названии или тексте
+    ссылки которых есть дата дня. Вкладки на странице (#tabs-2) - это один и тот же HTML."""
+    pat, out, seen, last_err, ok = date_pattern(day), [], set(), None, False
+    for page in SITE_URLS:
+        try:
+            _, _, links, _ = page_links(page)
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log.warning("сайт %s недоступен: %r", page, e)
             continue
-        url = urljoin(r.url, href)
-        name = unquote(url.rsplit("/", 1)[-1].split("?")[0])
-        if url in seen or not pat.search(f"{text} {name} {unquote(url)}"):
-            continue
-        if not (".pdf" in url.lower() or "pdf" in text.lower() or "file" in url.lower() or "download" in url.lower()):
-            continue  # ссылка с датой, но не похожая на файл (например, новость)
-        seen.add(url)
-        out.append({"name": (text or name) + ("" if (text or name).lower().endswith(".pdf") else ".pdf"),
-                    "site_url": url})
+        for url, text in links:
+            name = unquote(url.rsplit("/", 1)[-1].split("?")[0])
+            dl = drive_download_url(url)
+            if dl is None and DRIVE_FOLDER.search(url):
+                continue  # ссылка на папку, а не на файл
+            if url in seen or not pat.search(f"{text} {name} {unquote(url)}"):
+                continue
+            if not (dl or ".pdf" in url.lower() or "pdf" in text.lower() or "file" in url.lower()
+                    or "download" in url.lower()):
+                continue  # ссылка с датой, но не похожая на файл (например, новость)
+            seen.add(url)
+            title = text or name
+            out.append({"name": title + ("" if title.lower().endswith(".pdf") else ".pdf"),
+                        "site_url": dl or url})
+    if not ok and last_err:
+        raise last_err
     return out
+
+
+def site_debug(day: date) -> str:
+    """Диагностика: что бот видит на страницах сайта и какие ссылки считает файлами замен."""
+    if not SITE_URLS:
+        return "SITE_URL пуст: сайт отключён."
+    pat, out = date_pattern(day), [f"Ищу дату: {day:%d.%m.%Y}"]
+    for page in SITE_URLS:
+        out += ["", f"Страница: {page}"]
+        try:
+            final, html, links, folders = page_links(page)
+        except Exception as e:  # noqa: BLE001
+            out.append(f"❌ Не получилось открыть: {e!r}")
+            continue
+        drive = [(h, t) for h, t in links if DRIVE_FILE.search(h)]
+        out += [f"Размер: {len(html)} символов, ссылок: {len(links)}, «.pdf» в коде: {html.lower().count('.pdf')}, "
+                f"Google Диск: файлов {len(drive)}, папок {len(folders)}"]
+        files = [(h, t) for h, t in links if re.search(r"pdf|file|download|drive\.google", h + t, re.I)]
+        out.append(f"Похожие на файлы ({len(files)}), первые 12:")
+        out += [f"• {t[:40] or '(без текста)'} → {h[:80]}{'  ✅ дата' if pat.search(t + unquote(h)) else ''}"
+                for h, t in files[:12]]
+        if not links:
+            out += ["Ссылок нет совсем: список, возможно, подгружается скриптом.",
+                    "Начало страницы: " + re.sub(r"\s+", " ", html[:300])]
+    try:
+        found = site_items(day)
+        out += ["", f"Итог: подходящих файлов на {day:%d.%m}: {len(found)}"] + [f"→ {f['site_url']}" for f in found]
+    except Exception as e:  # noqa: BLE001
+        out += ["", f"Ошибка поиска: {e!r}"]
+    return "\n".join(out)
+
+
+async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/site [дата] - что бот видит на сайте колледжа (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    today = datetime.now(TZ).date()
+    day, err = parse_day(" ".join(context.args or []), today)
+    day = day or next_workday(today)
+    try:
+        text = await asyncio.to_thread(site_debug, day)
+    except Exception as e:  # noqa: BLE001
+        text = f"❌ Не получилось открыть сайт: {e!r}"
+    await update.message.reply_text(text[:4000], reply_markup=KEYBOARD)
 
 
 def site_find(day: date):
@@ -3325,6 +3413,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("groups", groups_cmd))
     app.add_handler(CommandHandler("testgroups", testgroups_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
