@@ -39,6 +39,7 @@ import re
 import secrets
 import threading
 import time
+from html import unescape
 from html.parser import HTMLParser
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -58,7 +59,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DISK_URL = os.environ.get("DISK_URL", "https://disk.yandex.by/d/mfUQ5pAX_ScALw")
 SITE_URL = os.environ.get("SITE_URL", "https://kso.minsk.edu.by/ru/main.aspx?guid=1321").strip()  # сайт колледжа, раздел «Замены»; пусто = не использовать
 SITE_URLS = [u for u in re.split(r"[\s,]+", SITE_URL) if u]  # можно несколько адресов через запятую или пробел
-SITE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; zameny-bot)"}
+SITE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept-Language": "ru,en;q=0.8"}
 GROUP_NAME = os.environ.get("GROUP_NAME", "01-24")  # как в блоке "Информационный час"
 GROUP_CODE = os.environ.get("GROUP_CODE", "124")    # как в первой колонке таблицы
 
@@ -291,24 +293,59 @@ DRIVE_FILE = re.compile(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:[^\"'#]
 DRIVE_FOLDER = re.compile(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders/|embeddedfolderview\?id=|folderview\?id=)([\w-]+)")
 
 
+_site_down_until = [0.0]   # если сайт не отвечает, пару минут не мучаем его и пользователей ожиданием
+_drive_titles = {}         # id файла на Google Диске -> (когда узнали, имя файла)
+
+
 def fetch_html(url: str):
-    r = requests.get(url, timeout=30, headers=SITE_HEADERS)
-    r.raise_for_status()
-    if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
-        r.encoding = r.apparent_encoding
-    return r.url, r.text
+    last = None
+    for _ in range(2):
+        try:
+            r = requests.get(url, timeout=(8, 25), headers=SITE_HEADERS)
+            r.raise_for_status()
+            if r.encoding and r.encoding.lower() in ("iso-8859-1", "latin-1"):
+                r.encoding = r.apparent_encoding
+            return r.url, r.text
+        except requests.RequestException as e:
+            last = e
+    raise last
+
+
+def drive_title(file_id: str) -> str:
+    """Имя файла на Google Диске (например «14.10.2026.pdf»): берём из заголовка страницы просмотра."""
+    now = time.time()
+    c = _drive_titles.get(file_id)
+    if c and now - c[0] < 120:
+        return c[1]
+    title = ""
+    try:
+        _, h = fetch_html(f"https://drive.google.com/file/d/{file_id}/view")
+        m = re.search(r"<title>(.*?)</title>", h, re.S | re.I)
+        title = unescape(m.group(1)).strip() if m else ""
+        title = re.sub(r"\s*[-–—]\s*Google\s+(Диск|Drive)\s*$", "", title, flags=re.I)
+    except Exception:  # noqa: BLE001
+        log.warning("не удалось узнать имя файла на Google Диске %s", file_id)
+    _drive_titles[file_id] = (now, title)
+    return title
 
 
 def page_links(page_url: str):
-    """Все ссылки страницы (href уже полный, текст) + ссылки из встроенных папок Google Диска.
+    """Все ссылки страницы (href уже полный, текст) + ссылки из папок Google Диска.
+    page_url может быть и прямой ссылкой на файл или папку Google Диска.
     Возвращает (итоговый url, html, ссылки, id папок Диска)."""
-    final, html = fetch_html(page_url)
-    parser = _LinkParser()
-    parser.feed(html)
-    links = [(urljoin(final, h), t) for h, t in parser.links
-             if h and not h.startswith(("#", "javascript:", "mailto:"))]
-    folders = sorted(set(DRIVE_FOLDER.findall(html)))
-    for fid in folders:  # папка Google Диска, встроенная или со ссылкой на странице: читаем её список файлов
+    if DRIVE_FILE.search(page_url):
+        return page_url, "", [(page_url, "")], []
+    m = DRIVE_FOLDER.search(page_url)
+    if m:
+        final, html, links, folders = page_url, "", [], [m.group(1)]
+    else:
+        final, html = fetch_html(page_url)
+        parser = _LinkParser()
+        parser.feed(html)
+        links = [(urljoin(final, h), t) for h, t in parser.links
+                 if h and not h.startswith(("#", "javascript:", "mailto:"))]
+        folders = sorted(set(DRIVE_FOLDER.findall(html)))
+    for fid in folders:  # папка Google Диска: читаем список файлов в ней
         try:
             _, fh = fetch_html(f"https://drive.google.com/embeddedfolderview?id={fid}#list")
             fp = _LinkParser()
@@ -325,9 +362,11 @@ def drive_download_url(url: str):
 
 
 def site_items(day: date):
-    """PDF-файлы замен с сайта колледжа (прямые ссылки или Google Диск), в названии или тексте
-    ссылки которых есть дата дня. Вкладки на странице (#tabs-2) - это один и тот же HTML."""
-    pat, out, seen, last_err, ok = date_pattern(day), [], set(), None, False
+    """PDF-файлы замен (с сайта колледжа или напрямую с Google Диска), у которых дата дня есть в
+    ссылке или в имени файла. Для файла на Диске без даты в ссылке имя берём со страницы Диска."""
+    if time.time() < _site_down_until[0]:
+        return []
+    pat, out, seen, last_err, ok, lookups = date_pattern(day), [], set(), None, False, 0
     for page in SITE_URLS:
         try:
             _, _, links, _ = page_links(page)
@@ -341,27 +380,36 @@ def site_items(day: date):
             dl = drive_download_url(url)
             if dl is None and DRIVE_FOLDER.search(url):
                 continue  # ссылка на папку, а не на файл
-            if url in seen or not pat.search(f"{text} {name} {unquote(url)}"):
+            if url in seen:
                 continue
-            if not (dl or ".pdf" in url.lower() or "pdf" in text.lower() or "file" in url.lower()
-                    or "download" in url.lower()):
+            title = text or name
+            if not pat.search(f"{text} {name} {unquote(url)}"):
+                if not dl or lookups >= 10:
+                    continue
+                lookups += 1  # в ссылке даты нет: смотрим настоящее имя файла на Диске
+                title = drive_title(DRIVE_FILE.search(url).group(1))
+                if not pat.search(title):
+                    continue
+            elif not (dl or ".pdf" in url.lower() or "pdf" in text.lower() or "file" in url.lower()
+                      or "download" in url.lower()):
                 continue  # ссылка с датой, но не похожая на файл (например, новость)
             seen.add(url)
-            title = text or name
             out.append({"name": title + ("" if title.lower().endswith(".pdf") else ".pdf"),
                         "site_url": dl or url})
     if not ok and last_err:
+        _site_down_until[0] = time.time() + 120
         raise last_err
     return out
 
 
 def site_debug(day: date) -> str:
-    """Диагностика: что бот видит на страницах сайта и какие ссылки считает файлами замен."""
+    """Диагностика: что бот видит на страницах сайта и какие файлы считает заменами."""
     if not SITE_URLS:
         return "SITE_URL пуст: сайт отключён."
+    _site_down_until[0] = 0
     pat, out = date_pattern(day), [f"Ищу дату: {day:%d.%m.%Y}"]
     for page in SITE_URLS:
-        out += ["", f"Страница: {page}"]
+        out += ["", f"Адрес: {page}"]
         try:
             final, html, links, folders = page_links(page)
         except Exception as e:  # noqa: BLE001
@@ -371,22 +419,24 @@ def site_debug(day: date) -> str:
         out += [f"Размер: {len(html)} символов, ссылок: {len(links)}, «.pdf» в коде: {html.lower().count('.pdf')}, "
                 f"Google Диск: файлов {len(drive)}, папок {len(folders)}"]
         files = [(h, t) for h, t in links if re.search(r"pdf|file|download|drive\.google", h + t, re.I)]
-        out.append(f"Похожие на файлы ({len(files)}), первые 12:")
-        out += [f"• {t[:40] or '(без текста)'} → {h[:80]}{'  ✅ дата' if pat.search(t + unquote(h)) else ''}"
-                for h, t in files[:12]]
+        out.append(f"Похожие на файлы ({len(files)}), первые 8:")
+        for h, t in files[:8]:
+            m = DRIVE_FILE.search(h)
+            real = f" [файл на Диске: {drive_title(m.group(1)) or '?'}]" if m else ""
+            out.append(f"• {t[:40] or '(без текста)'} → {h[:70]}{real}")
         if not links:
             out += ["Ссылок нет совсем: список, возможно, подгружается скриптом.",
                     "Начало страницы: " + re.sub(r"\s+", " ", html[:300])]
     try:
         found = site_items(day)
-        out += ["", f"Итог: подходящих файлов на {day:%d.%m}: {len(found)}"] + [f"→ {f['site_url']}" for f in found]
+        out += ["", f"Итог: подходящих файлов на {day:%d.%m}: {len(found)}"] + [f"→ {f['name']}" for f in found]
     except Exception as e:  # noqa: BLE001
         out += ["", f"Ошибка поиска: {e!r}"]
     return "\n".join(out)
 
 
 async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/site [дата] - что бот видит на сайте колледжа (только для ADMIN_IDS)."""
+    """/site [дата] - что бот видит на сайте колледжа и на Google Диске (только для ADMIN_IDS)."""
     if not _admin_only(update):
         await update.message.reply_text(not_admin_text(update))
         return
@@ -402,9 +452,9 @@ async def site_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def site_find(day: date):
     for it in site_items(day):
-        try:  # «подпись» версии файла, чтобы заметить, что файл перезалили
-            h = requests.head(it["site_url"], timeout=20, allow_redirects=True, headers=SITE_HEADERS)
-            it["modified"] = "|".join(h.headers.get(k, "") for k in ("ETag", "Last-Modified", "Content-Length"))
+        try:  # «подпись» версии файла, чтобы заметить, что файл перезалили (только заголовки, файл не качаем)
+            with requests.get(it["site_url"], timeout=20, stream=True, headers=SITE_HEADERS) as h:
+                it["modified"] = "|".join(h.headers.get(k, "") for k in ("ETag", "Last-Modified", "Content-Length"))
         except Exception:  # noqa: BLE001
             pass
         return it
