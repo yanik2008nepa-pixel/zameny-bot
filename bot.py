@@ -72,7 +72,7 @@ SKIP = {"√", "✓"}  # значок "как выше"
 MENU_BUTTON = "⚙️ Другое"
 QUICK_BUTTON = "⚡ Быстро"   # открывает 3 кнопки: Замены, Пары завтра, Пары сегодня
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", MENU_BUTTON], [QUICK_BUTTON]], resize_keyboard=True, is_persistent=True
+    [["Есть ли замены?", QUICK_BUTTON], [MENU_BUTTON]], resize_keyboard=True, is_persistent=True
 )  # кнопки внизу; Расписание, Уведомления и Помощь спрятаны в меню «Другое»
 MENU_BACK = "menu:o"        # callback_data кнопки «Назад»: возвращает в меню «Другое»
 BACK_LABEL = "↩️ Назад"
@@ -1535,15 +1535,15 @@ FUN = {
     ],
     # «Есть ли замены?»: файл выложен
     "posted": [
-        "Бегом смотреть — жми «Замены» 🏃",
+        "Бегом смотреть — жми «⚡ Быстро» → «Замены» 🏃",
         "Файл уже тут, осталось только прочитать 📄",
         "Свежие замены, ещё тёплые 🔥",
         "Есть что почитать на ночь 📖",
         "Новости с фронта расписания: файл выложен 📰",
-        "Не тяни, жми «Замены» 👇",
+        "Не тяни, жми «⚡ Быстро» → «Замены» 👇",
         "Выложили! Расписание больше не загадка 🔎",
         "Ну что, посмотрим, кому повезло? 🎲",
-        "Интрига: есть изменения или нет? Узнаем, нажав «Замены» 🕵️",
+        "Интрига: есть изменения или нет? Узнаем, нажав «⚡ Быстро» → «Замены» 🕵️",
         "Файл на месте. Дальше — дело техники 🛠",
         "Файл появился. Читай — и спи спокойно 😴",
         "Кто предупреждён, тот не опоздал ⏰",
@@ -1554,7 +1554,7 @@ FUN = {
         "Файл выложен — самое время всё узнать 🔍",
         "Замены на месте, можно смотреть 👇",
         "Ничего не пропустишь, если заглянешь сейчас 👀",
-        "Время истины пришло: жми «Замены» ⚖️",
+        "Время истины пришло: жми «⚡ Быстро» → «Замены» ⚖️",
         "Есть файл, есть повод проверить 🙌",
     ],
     # «Есть ли замены?»: файла нет
@@ -1925,7 +1925,7 @@ async def check_changes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if item is None:
         text = f"❌ Замен на {title} пока нет.\n\n" + fun("notposted_check", day)
     else:
-        text = f"✅ Замены на {title} уже выложены. Нажмите «Замены», чтобы посмотреть.\n\n" + fun("posted", day)
+        text = f"✅ Замены на {title} уже выложены. Нажмите «⚡ Быстро» → «Замены», чтобы посмотреть.\n\n" + fun("posted", day)
     await update.message.reply_text(text, reply_markup=KEYBOARD)
 
 
@@ -2384,28 +2384,41 @@ async def quick_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(QUICK_TEXT, reply_markup=quick_markup())
 
 
+def quick_back_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data="qk:o")]])
+
+
 async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if await cb_guard(q):
         return
     act = q.data.split(":", 1)[1] if ":" in q.data else ""
-    if act not in ("z", "t", "d"):
+    if act not in ("o", "z", "t", "d"):
         await q.answer()
         return
     await q.answer()  # сразу убираем «часики» на кнопке
     cid, bot = q.message.chat_id, context.bot
     today = datetime.now(TZ).date()
+    if act == "o":  # назад к выбору из трёх кнопок
+        await _edit(q, QUICK_TEXT, quick_markup())
+        return
     if act == "z":  # замены на завтра: фото файла, как кнопка «Замены»
         track(update, cat="замены", when=datetime.now(TZ))
         day = next_workday(today)
         try:
             imgs = await asyncio.to_thread(make_photos, day)
             if imgs is None:
-                await bot.send_message(cid, f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже.\n\n"
-                                       + fun("notposted", day))
+                text = (f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже.\n\n"
+                        + fun("notposted", day))
+                await _edit(q, text[:4000], quick_back_markup())
             else:
                 cap = f"📅 Замены на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
+                try:  # фото нельзя вставить в старое сообщение: убираем меню, шлём фото и снова меню ниже
+                    await q.delete_message()
+                except BadRequest:
+                    pass
                 await _send_photos(bot, cid, imgs, cap)
+                await bot.send_message(cid, QUICK_TEXT, reply_markup=quick_markup())
             return
         except Exception:  # noqa: BLE001
             log.exception("не получилось отправить фото замен, отправляю текстом")
@@ -2414,7 +2427,7 @@ async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001
             log.exception("ошибка")
             reply = f"Не получилось разобрать замены: {e}"
-        await bot.send_message(cid, reply[:4000])
+        await bot.send_message(cid, reply[:4000], reply_markup=quick_back_markup())
         return
     day = next_workday(today) if act == "t" else today  # t - пары завтра, d - пары сегодня
     track(update, cat="пары", when=datetime.now(TZ))
@@ -2423,7 +2436,7 @@ async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:  # noqa: BLE001
         log.exception("ошибка расписания")
         reply = f"Не получилось собрать расписание: {e}"
-    await bot.send_message(cid, reply[:4000])
+    await _edit(q, reply[:4000], quick_back_markup())
 
 
 # ---------- Меню «Другое» ----------
@@ -2746,7 +2759,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
         if not closed:
             await broadcast_groups(context.bot, None, imgs)
     else:  # запасной вариант: фото сделать не вышло (или SEND_PHOTO=0), чтобы уведомление не пропало
-        await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»", ids=recipients)
+        await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее: «⚡ Быстро» → «Замены»", ids=recipients)
         if not closed:
             await broadcast_groups(context.bot, f"{head}\n\n{text}")
     await broadcast_hint(context.bot)  # у кого уведомления выключены: только «Есть замены»
@@ -3538,8 +3551,8 @@ def start_note(uid: int) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_sub(update.effective_chat.id, True)
     await update.message.reply_text(
-        "«Замены» — замены на завтра. «Есть ли замены?» — выложены ли они. "
-        "«Пары завтра» — расписание с учётом замен.\n"
+        "«Есть ли замены?» — выложены ли замены на завтра. "
+        "«⚡ Быстро» — замены, пары на завтра и пары на сегодня.\n"
         "«⚙️ Другое» — расписание на любой день недели (Пн–Сб, там же можно глянуть замены), настройки уведомлений и помощь.\n"
         "Можно уточнять день: «Пары пятница», «Пары пн», «Замены 05.10», «Пары послезавтра».\n\n"
         f"🔔 Я включил уведомления: напишу сам, когда выложат замены, в {get_pref(update.effective_chat.id)['time']} "
