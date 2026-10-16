@@ -754,7 +754,7 @@ def when_phrase(day) -> str:
     return f"{acc[day.weekday()]} ({day:%d.%m})"
 
 
-def lessons_to_lines(lessons, rooms=None, day=None):
+def lessons_to_lines(lessons, rooms=None, day=None, compare=True):
     """Шаблон: «• Уроки 1–2: завтра вместо <было> будет <стало>». В скобках - препод и кабинет
     (кабинета нет в файле - не пишем). Одна и та же функция работает для кнопки «Замены» и для рассылки."""
     when = when_phrase(day)
@@ -774,14 +774,14 @@ def lessons_to_lines(lessons, rooms=None, day=None):
     for nums, (old, new) in rows:
         label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
         if new.lower().startswith("урок снят"):
-            was = f" вместо {old}" if old else ""
+            was = f" вместо {old}" if old and compare else ""
             out.append(f"• {label}: {when}{was} {CANCEL_MARK}")
         elif not old:
             out.append(f"• {label}: {when} дополнительно будет {new}")
         elif not new:
-            out.append(f"• {label}: {when} вместо {old} {CANCEL_MARK}")
+            out.append(f"• {label}: {when}{f' вместо {old}' if compare else ''} {CANCEL_MARK}")
         else:
-            out.append(f"• {label}: {when} вместо {old} будет {new}")
+            out.append(f"• {label}: {when}{f' вместо {old}' if compare else ''} будет {new}")
     return out
 
 
@@ -807,7 +807,7 @@ def info_hour(lines):
     return None
 
 
-def analyze(pdf_bytes: bytes, day: date = None):
+def analyze(pdf_bytes: bytes, day: date = None, compare: bool = True):
     """Возвращает (строки замен | None, инфо-час | None, текст для отладки)."""
     changes, info, debug = None, None, []
     group_lessons, rooms, side_raw = None, [], []
@@ -831,7 +831,7 @@ def analyze(pdf_bytes: bytes, day: date = None):
                 group_lessons = lessons
                 debug.append(f"Блок {GROUP_CODE}:\n" + "\n".join(raw))
     if group_lessons is not None:
-        changes = lessons_to_lines(group_lessons, rooms, day)
+        changes = lessons_to_lines(group_lessons, rooms, day, compare)
     if changes is None:
         debug.append(f"Группа {GROUP_CODE} в таблице не найдена.")
     debug.append(f"Информационный час: {info or 'нет'}")
@@ -1804,12 +1804,12 @@ def build_message(day: date, changes, info, fun_on: bool = False):
     return f"{head}\n\n{body}"
 
 
-def make_reply(day: date, debug: bool = False, fun_on: bool = False) -> str:
+def make_reply(day: date, debug: bool = False, fun_on: bool = False, compare: bool = True) -> str:
     item = find_pdf(day)
     if item is None:
         text = f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже."
         return text + ("\n\n" + fun("notposted", day) if fun_on and not debug else "")
-    changes, info, dbg = analyze(download(item), day)
+    changes, info, dbg = analyze(download(item), day, compare)
     return dbg if debug else build_message(day, changes, info, fun_on)
 
 
@@ -1853,7 +1853,7 @@ def merge_day(day: date, changes: dict):
     return items
 
 
-def make_schedule_reply(day: date, fun_on: bool = False) -> str:
+def make_schedule_reply(day: date, fun_on: bool = False, compare: bool = True) -> str:
     item = find_pdf(day)
     changes, info = {}, None
     if item is not None:
@@ -1863,17 +1863,21 @@ def make_schedule_reply(day: date, fun_on: bool = False) -> str:
     for nums, text, was in items:
         label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
         if text == "урок снят":
-            lines.append(f"• {label}: ❌ урок снят" + (f" (было: {was})" if was else ""))
-        elif was is None:
+            lines.append(f"• {label}: ❌ урок снят" + (f" (было: {was})" if was and compare else ""))
+        elif was is None or not compare:
             lines.append(f"• {label}: {text}")
         else:
             lines.append(f"• {label}: 🔄 {text} (по расписанию: {was or 'нет'})")
     head = f"📚 Пары на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
     body = "\n".join(lines) if lines else "Занятий нет"
+    has_cancel = any(t == "урок снят" for _, t, _ in items)
+    has_change = any(w is not None for _, _, w in items)
     if item is None:
         body += "\n\nℹ️ Замены на этот день пока не выложены, показано обычное расписание."
-    elif any("🔄" in l or "❌" in l for l in lines):
+    elif has_change and compare:
         body += "\n\n🔄 — замена по сравнению с расписанием"
+    elif has_change:
+        body += "\n\nℹ️ Пары показаны с учётом замен. Сравнение с расписанием выключено: «⚙️ Другое»."
     else:
         body += "\n\n" + random.choice([
             "Замен нет, всё по расписанию.", "Замен нет — живём по плану 👌",
@@ -1885,9 +1889,9 @@ def make_schedule_reply(day: date, fun_on: bool = False) -> str:
             kind = "noclasses"
         elif item is None:
             kind = "sched_notposted"
-        elif any("❌" in l for l in lines):
+        elif has_cancel:
             kind = "cancel"
-        elif any("🔄" in l for l in lines):
+        elif has_change and compare:
             kind = "sched_changed"
         else:
             kind = "sched_plain"
@@ -1954,7 +1958,7 @@ async def zameny(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             log.exception("не получилось отправить фото замен, отправляю текстом")
     try:
-        reply = await asyncio.to_thread(make_reply, day, debug, True)
+        reply = await asyncio.to_thread(make_reply, day, debug, True, get_cmp(update.effective_chat.id))
     except Exception as e:  # noqa: BLE001
         log.exception("ошибка")
         reply = f"Не получилось разобрать замены: {e}"
@@ -2000,7 +2004,7 @@ async def lessons_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     day = day or next_workday(today)
     try:
-        reply = await asyncio.to_thread(make_schedule_reply, day, True)
+        reply = await asyncio.to_thread(make_schedule_reply, day, True, get_cmp(update.effective_chat.id))
     except Exception as e:  # noqa: BLE001
         log.exception("ошибка расписания")
         reply = f"Не получилось собрать расписание: {e}"
@@ -2106,7 +2110,7 @@ async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         day = nearest_date(wd, datetime.now(TZ).date())
         try:
-            text = await asyncio.to_thread(make_schedule_reply, day)
+            text = await asyncio.to_thread(make_schedule_reply, day, False, get_cmp(q.message.chat_id))
         except Exception as e:  # noqa: BLE001
             log.exception("ошибка расписания")
             text = f"Не получилось собрать расписание: {e}"
@@ -2129,10 +2133,16 @@ KINDS = {  # "m" - расписание на день, "e" - расписани�
 }
 
 
+def get_cmp(chat_id: int) -> bool:
+    """Показывать ли сравнение с обычным расписанием (по умолчанию да). Настройка в меню «Другое»."""
+    return bool(DATA["prefs"].get(str(chat_id), {}).get("cmp", True))
+
+
 def get_pref(chat_id: int) -> dict:
     p = DATA["prefs"].get(str(chat_id))
     if p is None:
         p = DATA["prefs"][str(chat_id)] = new_pref(False)
+    p.setdefault("cmp", True)
     p.setdefault("time", MORNING_DEFAULT)
     p.setdefault("last", "")
     p.setdefault("evening", False)
@@ -2425,7 +2435,7 @@ async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             log.exception("не получилось отправить фото замен, отправляю текстом")
         try:
-            reply = await asyncio.to_thread(make_reply, day, False, True)
+            reply = await asyncio.to_thread(make_reply, day, False, True, get_cmp(cid))
         except Exception as e:  # noqa: BLE001
             log.exception("ошибка")
             reply = f"Не получилось разобрать замены: {e}"
@@ -2434,7 +2444,7 @@ async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = next_workday(today) if act == "t" else today  # t - пары завтра, d - пары сегодня
     track(update, cat="пары", when=datetime.now(TZ))
     try:
-        reply = await asyncio.to_thread(make_schedule_reply, day, True)
+        reply = await asyncio.to_thread(make_schedule_reply, day, True, get_cmp(cid))
     except Exception as e:  # noqa: BLE001
         log.exception("ошибка расписания")
         reply = f"Не получилось собрать расписание: {e}"
@@ -2450,11 +2460,12 @@ MENU_TEXT = "⚙️ Другое — выбери раздел:"
 SCHEDULE_TEXT = "📅 Выбери день недели — покажу расписание без замен."
 
 
-def menu_markup() -> InlineKeyboardMarkup:
+def menu_markup(chat_id: int = 0) -> InlineKeyboardMarkup:
     B = InlineKeyboardButton
     return InlineKeyboardMarkup([
         [B("📅 Расписание", callback_data="menu:s")],
         [B("🔔 Уведомления", callback_data="menu:n")],
+        [B(f"🔀 Сравнение с расписанием: {'вкл' if get_cmp(chat_id) else 'выкл'}", callback_data="menu:c")],
         [B("🆘 Помощь", callback_data="menu:h")],
         [B("✖️ Закрыть", callback_data="menu:x")],
     ])
@@ -2463,7 +2474,7 @@ def menu_markup() -> InlineKeyboardMarkup:
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка «⚙️ Другое» или /menu - показываем меню."""
     AWAIT_TIME.pop(update.effective_chat.id, None)  # если ждали время текстом, больше не ждём
-    await update.message.reply_text(MENU_TEXT, reply_markup=menu_markup())
+    await update.message.reply_text(MENU_TEXT, reply_markup=menu_markup(update.effective_chat.id))
 
 
 async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2475,7 +2486,14 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAIT_TIME.pop(cid, None)
     await q.answer()
     if act == "o":      # назад в меню
-        await _edit(q, MENU_TEXT, menu_markup())
+        await _edit(q, MENU_TEXT, menu_markup(cid))
+    elif act == "c":    # включить/выключить сравнение с расписанием
+        p = get_pref(cid)
+        p["cmp"] = not p["cmp"]
+        save_data()
+        await _edit(q, MENU_TEXT + "\n\n" + (
+            "🔀 Сравнение включено: в парах и заменах показано, что было по расписанию." if p["cmp"] else
+            "🔀 Сравнение выключено: показаны только итоговые пары и замены, без «было»."), menu_markup(cid))
     elif act == "s":    # расписание
         track(update, cat="расписание", when=datetime.now(TZ))
         await _edit(q, SCHEDULE_TEXT, schedule_markup(back=True))
@@ -2794,19 +2812,21 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE):
         p["last"] = today.isoformat()
     save_data()
     try:
-        text = await asyncio.to_thread(make_schedule_reply, today)
+        texts = {flag: await asyncio.to_thread(make_schedule_reply, today, False, flag)
+                 for flag in {get_cmp(cid) for cid, _, _ in due}}  # текст зависит от настройки сравнения у человека
     except Exception:  # noqa: BLE001
         log.exception("ошибка утреннего расписания")
         for _, p, _ in due:  # попробуем в следующую минуту
             p["last"] = ""
         save_data()
         return
-    morning = [cid for cid, _, hhmm in due if hhmm < "12:00"]
-    later = [cid for cid, _, hhmm in due if hhmm >= "12:00"]
-    if morning:
-        await broadcast(context.bot, f"☀️ Доброе утро!\n\n{text}", ids=morning)
-    if later:
-        await broadcast(context.bot, f"📅 Расписание на сегодня\n\n{text}", ids=later)
+    for flag, text in texts.items():
+        morning = [cid for cid, _, hhmm in due if hhmm < "12:00" and get_cmp(cid) == flag]
+        later = [cid for cid, _, hhmm in due if hhmm >= "12:00" and get_cmp(cid) == flag]
+        if morning:
+            await broadcast(context.bot, f"☀️ Доброе утро!\n\n{text}", ids=morning)
+        if later:
+            await broadcast(context.bot, f"📅 Расписание на сегодня\n\n{text}", ids=later)
 
 
 async def evening_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2824,14 +2844,17 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
         p["elast"] = today.isoformat()
     save_data()
     try:
-        text = await asyncio.to_thread(make_schedule_reply, day)
+        texts = {flag: await asyncio.to_thread(make_schedule_reply, day, False, flag)
+                 for flag in {get_cmp(cid) for cid, _, _ in due}}
     except Exception:  # noqa: BLE001
         log.exception("ошибка расписания на завтра")
         for _, p, _ in due:
             p["elast"] = ""
         save_data()
         return
-    await broadcast(context.bot, f"🌙 Расписание на завтра\n\n{text}", ids=[cid for cid, _, _ in due])
+    for flag, text in texts.items():
+        await broadcast(context.bot, f"🌙 Расписание на завтра\n\n{text}",
+                        ids=[cid for cid, _, _ in due if get_cmp(cid) == flag])
 
 
 # ---------- Статистика ----------
