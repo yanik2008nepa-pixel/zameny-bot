@@ -2636,7 +2636,7 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
         return
     _last_check = time.monotonic()
     on = DATA["broadcast"]["on"]
-    if on and not DATA["subs"] and not DATA["groups"] and not non_subscribers():
+    if on and not DATA["subs"] and not DATA["groups"] and not non_subscribers() and not ADMIN_IDS:
         return
     day = next_workday(datetime.now(TZ).date())
     try:
@@ -2668,18 +2668,24 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     DATA["notified"] = {"day": day.isoformat(), "sig": sig, "text": text}
     save_data()
     head = "🔔 Замены обновили!" if updated else "🔔 Выложили замены на завтра!"
+    # Бот закрыт (включена проверка ключа): замены получают только люди с доступом и админы, группы и каналы не получают.
+    # Бот открыт (доступ без ключей): замены идут всем подписчикам и ещё в группы и каналы.
+    closed = DATA["access"]["required"]
+    recipients = sorted(set(DATA["subs"]) | ADMIN_IDS) if closed else None  # None = все подписчики
     imgs = []
-    if SEND_PHOTO and (DATA["subs"] or DATA["groups"]):  # рассылка идёт фото, и в личку, и в группы
+    if SEND_PHOTO and (DATA["subs"] or DATA["groups"] or ADMIN_IDS):  # рассылка идёт фото, и в личку, и в группы
         try:
             imgs = await asyncio.to_thread(pdf_to_images, pdf)
         except Exception:  # noqa: BLE001
             log.exception("не получилось сделать фото из PDF, отправлю только текст")
     if imgs:  # рассылка (личка и группы): только фото файла, без текста
-        await broadcast(context.bot, None, imgs=imgs)
-        await broadcast_groups(context.bot, None, imgs)
+        await broadcast(context.bot, None, ids=recipients, imgs=imgs)
+        if not closed:
+            await broadcast_groups(context.bot, None, imgs)
     else:  # запасной вариант: фото сделать не вышло (или SEND_PHOTO=0), чтобы уведомление не пропало
-        await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»")
-        await broadcast_groups(context.bot, f"{head}\n\n{text}")
+        await broadcast(context.bot, f"{head}\n\n{text}\n\nПодробнее по кнопке «Замены»", ids=recipients)
+        if not closed:
+            await broadcast_groups(context.bot, f"{head}\n\n{text}")
     await broadcast_hint(context.bot)  # у кого уведомления выключены: только «Есть замены»
 
 
