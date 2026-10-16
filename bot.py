@@ -70,6 +70,7 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
 MENU_BUTTON = "⚙️ Другое"
+KB_VERSION = 2   # номер раскладки нижних кнопок: увеличь, когда меняешь KEYBOARD, и бот обновит кнопки у всех
 QUICK_BUTTON = "⚡ Быстро"   # открывает 3 кнопки: Замены, Пары завтра, Пары сегодня
 KEYBOARD = ReplyKeyboardMarkup(
     [["Есть ли замены?", QUICK_BUTTON], [MENU_BUTTON]], resize_keyboard=True, is_persistent=True
@@ -125,6 +126,7 @@ def new_pref(morning: bool, hhmm: str = MORNING_DEFAULT, evening: bool = False, 
 def fix_data(d):
     """Добавляет недостающие поля и переносит старые форматы."""
     d.setdefault("subs", [])
+    d.setdefault("kb", {})  # user_id -> версия нижних кнопок, которую бот уже показал этому человеку
     d.setdefault("groups", {})  # chat_id (отрицательный) -> {"title", "type", "added_by"}: группы и каналы, куда шлём только замены
     d.setdefault("notified", {})
     d.setdefault("prefs", {})  # chat_id -> {"morning"/"time"/"last": расписание на день, "evening"/"etime"/"elast": расписание на завтра}
@@ -3548,7 +3550,19 @@ def start_note(uid: int) -> str:
     return ""
 
 
+async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram не меняет нижние кнопки сам: старые остаются, пока бот не пришлёт сообщение с новыми.
+    Если у человека кнопки старой версии, один раз присылаем короткое сообщение с актуальными."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or DATA["kb"].get(str(user.id)) == KB_VERSION:
+        return
+    DATA["kb"][str(user.id)] = KB_VERSION
+    save_data()
+    await _safe_send(context.bot, msg.chat_id, "⌨️ Обновил кнопки внизу.", KEYBOARD)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    DATA["kb"][str(update.effective_user.id)] = KB_VERSION  # /start и так присылает актуальные кнопки
     set_sub(update.effective_chat.id, True)
     await update.message.reply_text(
         "«Есть ли замены?» — выложены ли замены на завтра. "
@@ -3618,6 +3632,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"(?i)^/restore"), restore_cmd))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(notif_cb, pattern=r"^ntf:"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ALL, kb_sync), group=1)  # обновить нижние кнопки, если они старые
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(quick_cb, pattern=r"^qk:"))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\W*быстро\W*$"), quick_button))  # кнопка «⚡ Быстро»
