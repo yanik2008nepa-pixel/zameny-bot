@@ -70,8 +70,9 @@ API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 SKIP = {"√", "✓"}  # значок "как выше"
 MENU_BUTTON = "⚙️ Другое"
+QUICK_BUTTON = "⚡ Быстро"   # открывает 3 кнопки: Замены, Пары завтра, Пары сегодня
 KEYBOARD = ReplyKeyboardMarkup(
-    [["Замены", "Есть ли замены?"], ["Пары завтра", MENU_BUTTON]], resize_keyboard=True, is_persistent=True
+    [["Замены", "Есть ли замены?"], ["Пары завтра", MENU_BUTTON], [QUICK_BUTTON]], resize_keyboard=True, is_persistent=True
 )  # кнопки внизу; Расписание, Уведомления и Помощь спрятаны в меню «Другое»
 MENU_BACK = "menu:o"        # callback_data кнопки «Назад»: возвращает в меню «Другое»
 BACK_LABEL = "↩️ Назад"
@@ -2363,6 +2364,68 @@ async def time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=notif_markup(cid, back))
 
 
+# ---------- Кнопка «⚡ Быстро»: Замены, Пары завтра, Пары сегодня ----------
+
+QUICK_TEXT = "⚡ Выбери, что показать:"
+
+
+def quick_markup() -> InlineKeyboardMarkup:
+    B = InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [B("🔄 Замены", callback_data="qk:z")],
+        [B("📚 Пары завтра", callback_data="qk:t")],
+        [B("📚 Пары сегодня", callback_data="qk:d")],
+    ])
+
+
+async def quick_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «⚡ Быстро»: присылает сообщение с тремя кнопками."""
+    AWAIT_TIME.pop(update.effective_chat.id, None)
+    await update.message.reply_text(QUICK_TEXT, reply_markup=quick_markup())
+
+
+async def quick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if await cb_guard(q):
+        return
+    act = q.data.split(":", 1)[1] if ":" in q.data else ""
+    if act not in ("z", "t", "d"):
+        await q.answer()
+        return
+    await q.answer()  # сразу убираем «часики» на кнопке
+    cid, bot = q.message.chat_id, context.bot
+    today = datetime.now(TZ).date()
+    if act == "z":  # замены на завтра: фото файла, как кнопка «Замены»
+        track(update, cat="замены", when=datetime.now(TZ))
+        day = next_workday(today)
+        try:
+            imgs = await asyncio.to_thread(make_photos, day)
+            if imgs is None:
+                await bot.send_message(cid, f"Файла с заменами на {day:%d.%m.%Y} в папке пока нет. Попробуйте позже.\n\n"
+                                       + fun("notposted", day))
+            else:
+                cap = f"📅 Замены на {day:%d.%m.%Y} ({DAYS[day.weekday()]}) — группа {GROUP_NAME}"
+                await _send_photos(bot, cid, imgs, cap)
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("не получилось отправить фото замен, отправляю текстом")
+        try:
+            reply = await asyncio.to_thread(make_reply, day, False, True)
+        except Exception as e:  # noqa: BLE001
+            log.exception("ошибка")
+            reply = f"Не получилось разобрать замены: {e}"
+        await bot.send_message(cid, reply[:4000])
+        return
+    day = next_workday(today) if act == "t" else today  # t - пары завтра, d - пары сегодня
+    track(update, cat="пары", when=datetime.now(TZ))
+    try:
+        reply = await asyncio.to_thread(make_schedule_reply, day, True)
+    except Exception as e:  # noqa: BLE001
+        log.exception("ошибка расписания")
+        reply = f"Не получилось собрать расписание: {e}"
+    await bot.send_message(cid, reply[:4000])
+
+
 # ---------- Меню «Другое» ----------
 # Кнопка «⚙️ Другое» (или /menu) присылает сообщение с разделами. Разделы открываются прямо в нём
 # (сообщение редактируется, чат не засоряется), в каждом есть «↩️ Назад»; «✖️ Закрыть» убирает меню.
@@ -2772,6 +2835,8 @@ def classify(text):
         return "замены"
     if re.match(r"^\W*другое\W*$", t):
         return "меню"
+    if re.match(r"^\W*быстро\W*$", t):
+        return "быстро"
     if "уведомлен" in t:
         return "уведомления"
     if "расписан" in t:
@@ -3541,6 +3606,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(notif_cb, pattern=r"^ntf:"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(quick_cb, pattern=r"^qk:"))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\W*быстро\W*$"), quick_button))  # кнопка «⚡ Быстро»
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\W*другое\W*$"), menu_button))  # кнопка «⚙️ Другое»
     app.add_handler(CommandHandler("menu", menu_button))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*(🔔\s*)?уведомлен"), toggle_sub))
