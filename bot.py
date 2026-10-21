@@ -1888,6 +1888,24 @@ def lessons_of(pdf_bytes: bytes):
     return found or {}, info, rooms
 
 
+def same_with_room(plan, d, num, rooms):
+    """Пара осталась по расписанию, но в файле замен у преподавателя указан кабинет: «Предмет (Препод, каб. 205)».
+    Кабинета нет - возвращает plan без изменений (ничего не дописываем)."""
+    teach = uniq(d["nt"]) or uniq(d["ot"])
+    auds = uniq(d["na"]) or uniq(d["oa"])
+    if auds:  # кабинет прямо в таблице
+        extra = uniq(teach) + [f"каб. {a}" for a in auds]
+        return f"{plan} ({', '.join(extra)})" if plan else ", ".join(extra)
+    found = {t: find_room(t, num, rooms) for t in teach} if rooms else {}
+    if not any(found.values()):
+        return plan
+    if len(teach) == 1:
+        extra = f"{teach[0]}, каб. {found[teach[0]]}"
+    else:
+        extra = "; ".join(f"{t} — каб. {found[t]}" if found[t] else t for t in teach)
+    return f"{plan} ({extra})" if plan else extra
+
+
 def merge_day(day: date, changes: dict, rooms=None):
     """Расписание дня с наложенными заменами: [(номера уроков, текст, было | None)].
     У заменённых пар кабинет берётся из таблицы или из боковой панели (rooms)."""
@@ -1903,6 +1921,8 @@ def merge_day(day: date, changes: dict, rooms=None):
             if new and new != old:
                 new_full = fmt_new(d, num, rooms) if rooms else new  # то же, но с кабинетом из боковой панели
                 text, was = ("урок снят" if new.lower().startswith("урок снят") else new_full), plan
+            elif new and plan:
+                text = same_with_room(plan, d, num, rooms)  # по расписанию, но кабинет указан в файле замен
         if not text:
             continue
         if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1:
