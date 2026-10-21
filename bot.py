@@ -26,6 +26,8 @@
   /broadcast on|off - включить/выключить рассылку замен в личку и в группы (по умолчанию выключена) (только для ADMIN_IDS)
   /site [дата]      - что бот видит на сайте колледжа: ссылки и найденные файлы замен (диагностика) (только для ADMIN_IDS)
   /setfile ссылка   - добавить ссылку на файл/папку Google Диска как источник замен; /clearfiles - убрать (только для ADMIN_IDS)
+  /roomsoff         - выключить кабинеты на перемене до 00:00 с уведомлением включившим; повторно - вернуть (только для ADMIN_IDS)
+  /roomtest [каб.]  - показать пример сообщения «кабинет на перемене» (только для ADMIN_IDS)
   /mykey            - свой статус доступа
 Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
   debug             - как бот разобрал файл (для проверки)
@@ -93,6 +95,73 @@ SCHEDULE = {
         "МНиЭПА", "МНиЭПА"],
 }
 
+# ---------- Расписание звонков ----------
+# Пн, вт, ср, пт и суббота - одно расписание, четверг отличается (другие перерывы, информационный час, до 10 уроков).
+SHOW_TIMES = True   # писать время пар в «Пары сегодня/завтра» и в напоминаниях; False - не писать
+BELLS_STD = {1: ("08:15", "09:00"), 2: ("09:10", "09:55"), 3: ("10:15", "11:00"), 4: ("11:20", "12:05"),
+             5: ("12:15", "13:00"), 6: ("13:10", "13:55"), 7: ("14:05", "14:50"), 8: ("15:00", "15:45")}
+BELLS_THU = {1: ("08:15", "09:00"), 2: ("09:10", "09:55"), 3: ("10:05", "10:50"), 4: ("11:10", "11:55"),
+             5: ("12:15", "13:00"), 6: ("14:00", "14:45"), 7: ("14:55", "15:40"), 8: ("15:50", "16:35"),
+             9: ("16:45", "17:30"), 10: ("17:40", "18:25")}
+INFO_HOUR_THU = ("13:20", "13:50")   # информационный час бывает по звонкам только в четверг
+BELLS_TEXT_STD = """8:10–8:15 — линейка
+8:15–9:00 — 1 урок
+9:00–9:10 — перерыв
+9:10–9:55 — 2 урок
+9:55–10:15 — перерыв (обед 1 смена)
+10:15–11:00 — 3 урок
+11:00–11:20 — перерыв (обед 2 смена)
+11:20–12:05 — 4 урок
+12:05–12:15 — перерыв
+12:15–13:00 — 5 урок
+13:00–13:10 — перерыв
+13:10–13:55 — 6 урок
+13:55–14:05 — перерыв
+14:05–14:50 — 7 урок
+14:50–15:00 — перерыв
+15:00–15:45 — 8 урок"""
+BELLS_TEXT_THU = """8:10–8:15 — линейка
+8:15–9:00 — 1 урок
+9:00–9:10 — перерыв
+9:10–9:55 — 2 урок
+9:55–10:05 — перерыв
+10:05–10:50 — 3 урок
+10:50–11:10 — перерыв (обед 1 смена)
+11:10–11:55 — 4 урок
+11:55–12:15 — перерыв (обед 2 смена)
+12:15–13:00 — 5 урок
+13:00–13:20 — перерыв (обед 3 смена)
+13:20–13:50 — информационный час
+13:50–14:00 — перерыв
+14:00–14:45 — 6 урок
+14:45–14:55 — перерыв
+14:55–15:40 — 7 урок
+15:40–15:50 — перерыв
+15:50–16:35 — 8 урок
+16:35–16:45 — перерыв
+16:45–17:30 — 9 урок
+17:30–17:40 — перерыв
+17:40–18:25 — 10 урок"""
+
+
+def bells_for(day):
+    return BELLS_THU if day is not None and day.weekday() == 3 else BELLS_STD
+
+
+def bell_range(day, nums):
+    """Время пары: «10:05–10:50»; у нескольких пар подряд - время каждой через запятую (между ними бывают
+    большие перерывы и информационный час): «10:05–10:50, 11:10–11:55». Нет в звонках - пустая строка."""
+    b = bells_for(day)
+    if not SHOW_TIMES or any(n not in b for n in nums):
+        return ""
+    return ", ".join(f"{b[n][0].lstrip('0')}–{b[n][1].lstrip('0')}" for n in nums)
+
+
+def bells_message(thursday: bool) -> str:
+    head = "🔔 Расписание звонков — четверг" if thursday else "🔔 Расписание звонков — пн, вт, ср, пт, сб"
+    return head + "\n\n" + (BELLS_TEXT_THU if thursday else BELLS_TEXT_STD)
+
+
 # База преподавателей по расписанию группы: предмет -> фамилия. Нужна, чтобы у пар, которых нет в файле замен,
 # найти кабинет преподавателя в боковой панели файла. Предмет пишется как в SCHEDULE (регистр, точки и пробелы не важны).
 # Хочешь добавить преподавателя: ("Предмет", "Фамилия"). Предмета нет в списке - кабинет у такой пары не пишем.
@@ -109,6 +178,11 @@ TEACHERS = [
     ("Цифр.и микропр.техника", "Кузьмич"),
     ("Защ нас. и терр от ЧС", "Стрига"),
 ]
+
+
+# Кабинеты преподавателей, которые почти всегда одни и те же. Используются, только если в файле замен у преподавателя
+# на этом уроке кабинета нет. Ключ - фамилия.
+DEFAULT_ROOMS = {"окулич": "218", "короткая": "219", "стрига": "205"}
 
 
 def _subj_key(x):
@@ -157,6 +231,7 @@ def fix_data(d):
     d.setdefault("stats", {"users": {}, "days": {}})
     d.setdefault("banned", {})  # user_id -> {"name": ..., "until": время конца бана или 0 = навсегда}
     d.setdefault("extra_urls", [])  # ссылки на файлы/папки Google Диска, добавленные админом командой /setfile
+    d.setdefault("rooms_off", {"day": ""})  # админ выключил «кабинет на перемене» до 00:00 этого дня
     d.setdefault("broadcast", {"on": False})  # рассылка замен (личка + группы): выключена, пока админ не включит
     acc = d.setdefault("access", {})
     acc.setdefault("required", ACCESS_REQUIRED)  # нужен ли ключ доступа
@@ -792,17 +867,25 @@ def parse_rooms(tails):
     return out
 
 
-def room_by_subject(plan, num, rooms):
-    """Пара по расписанию: преподавателя берём из TEACHERS (по названию предмета), кабинет - из боковой панели.
-    Возвращает «Фамилия И.О., каб. N» или None (нет преподавателя в базе или нет кабинета в файле)."""
+def subject_room(plan, num, rooms):
+    """(преподаватель, кабинет) для пары по расписанию: фамилия из TEACHERS, кабинет из боковой панели.
+    None - нет преподавателя в базе или нет кабинета в файле."""
     surname = TEACHER_OF.get(_subj_key(plan))
-    if not surname or not rooms:
+    if not surname:
         return None
     sn = _norm(surname)
-    for r in rooms:
+    for r in rooms or []:
         if r["name"] == sn and num in r["lessons"]:
-            return f"{r['disp']}, каб. {r['room']}"
+            return r["disp"], r["room"]
+    if sn in DEFAULT_ROOMS:  # преподавателя нет в файле замен - постоянный кабинет
+        return surname, DEFAULT_ROOMS[sn]
     return None
+
+
+def room_by_subject(plan, num, rooms):
+    """Пара по расписанию: «Фамилия И.О., каб. N» или None."""
+    r = subject_room(plan, num, rooms)
+    return f"{r[0]}, каб. {r[1]}" if r else None
 
 
 def find_room(teacher, num, rooms):
@@ -818,13 +901,13 @@ def find_room(teacher, num, rooms):
         if init and r["init"] and not (init.startswith(r["init"]) or r["init"].startswith(init)):
             continue  # однофамильцы с другими инициалами
         return r["room"]
-    return None
+    return DEFAULT_ROOMS.get(name)  # в файле замен кабинета нет - постоянный кабинет преподавателя, если он известен
 
 
 def fmt_new(d, num, rooms):
     """Как fmt для новой пары, но с кабинетом из боковой панели, если в таблице он не указан."""
     teach, auds = uniq(d["nt"]), uniq(d["na"])
-    if auds or not rooms:
+    if auds:
         return fmt(d["ns"], d["nt"], d["na"])
     found = {t: find_room(t, num, rooms) for t in teach}
     if not any(found.values()):
@@ -1940,7 +2023,7 @@ def same_with_room(plan, d, num, rooms):
     if auds:  # кабинет прямо в таблице
         extra = uniq(teach) + [f"каб. {a}" for a in auds]
         return f"{plan} ({', '.join(extra)})" if plan else ", ".join(extra)
-    found = {t: find_room(t, num, rooms) for t in teach} if rooms else {}
+    found = {t: find_room(t, num, rooms or []) for t in teach}
     if not any(found.values()):
         return plan
     if len(teach) == 1:
@@ -1963,7 +2046,7 @@ def merge_day(day: date, changes: dict, rooms=None):
             old = fmt(d["os"], d["ot"], d["oa"])
             new = fmt(d["ns"], d["nt"], d["na"])
             if new and new != old:
-                new_full = fmt_new(d, num, rooms) if rooms else new  # то же, но с кабинетом из боковой панели
+                new_full = fmt_new(d, num, rooms or [])  # то же, но с кабинетом из боковой панели
                 text, was = ("урок снят" if new.lower().startswith("урок снят") else new_full), plan
             elif new and plan:
                 text = same_with_room(plan, d, num, rooms)  # по расписанию, но кабинет указан в файле замен
@@ -1990,6 +2073,8 @@ def make_schedule_reply(day: date, fun_on: bool = False, compare: bool = True) -
     items = merge_day(day, changes, rooms)
     for nums, text, was in items:
         label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
+        if tm := bell_range(day, nums):
+            label += f" ({tm})"
         if text == "урок снят":
             lines.append(f"• {label}: ❌ урок снят" + (f" (было: {was})" if was and compare else ""))
         elif was is None or not compare:
@@ -2011,7 +2096,9 @@ def make_schedule_reply(day: date, fun_on: bool = False, compare: bool = True) -
             "Замен нет, всё по расписанию.", "Замен нет — живём по плану 👌",
             "Всё по расписанию, сюрпризов нет.", "Замен нет. Редкая удача, пользуйся 😄"])
     if info:
-        body += "\n\n🕐 Информационный час"
+        body += "\n\n🕐 Информационный час" + (
+            f" ({INFO_HOUR_THU[0].lstrip('0')}–{INFO_HOUR_THU[1].lstrip('0')})"
+            if SHOW_TIMES and day.weekday() == 3 else "")
     if fun_on:
         if not lines:
             kind = "noclasses"
@@ -2276,6 +2363,7 @@ def get_pref(chat_id: int) -> dict:
     p.setdefault("evening", False)
     p.setdefault("etime", EVENING_DEFAULT)
     p.setdefault("elast", "")
+    p.setdefault("rooms", False)  # «кабинет на перемене»: выключено у всех, пока человек сам не включит
     return p
 
 
@@ -2347,6 +2435,7 @@ def notif_text(chat_id: int) -> str:
         f"• Замены: {'включены — напишу, когда выложат или обновят файл' if alerts else 'выключены'}",
         f"• Расписание на день: {'включено — пришлю в ' + p['time'] if p['morning'] else 'выключено'}",
         f"• Расписание на завтра: {'включено — пришлю в ' + p['etime'] if p['evening'] else 'выключено'}",
+        f"• Кабинет на перемене: {'включён — в начале перемены напишу, если кабинет следующей пары меняется' if p['rooms'] else 'выключен'}",
         "", "Ошибки или неточности? «⚙️ Другое» → «🆘 Помощь».",
     ])
 
@@ -2360,6 +2449,7 @@ def notif_markup(chat_id: int, back: bool = False) -> InlineKeyboardMarkup:
     rows.append([B(f"{'🌆' if p['evening'] else '🌙'} Расписание на завтра: {'вкл' if p['evening'] else 'выкл'}", callback_data="ntf:e")])
     if p["evening"]:
         rows.append([B(f"⏰ Время (завтра): {p['etime']}", callback_data="ntf:et")])
+    rows.append([B(f"{'🚪' if p['rooms'] else '🔕'} Кабинет на перемене: {'вкл' if p['rooms'] else 'выкл'}", callback_data="ntf:r")])
     if back:  # экран открыт из меню «Другое»
         rows.append([B(BACK_LABEL, callback_data=MENU_BACK)])
     return InlineKeyboardMarkup(rows)
@@ -2470,6 +2560,12 @@ async def notif_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         what = "на день" if kind == "m" else "на завтра"
         hhmm = get_pref(cid)[KINDS[kind]["time"]]
         note = f"☀️ Расписание {what} включено — в {hhmm}" if on else f"🌙 Расписание {what} выключено"
+    elif act == "r":
+        p = get_pref(cid)
+        p["rooms"] = not p["rooms"]
+        save_data()
+        note = ("🚪 Кабинет на перемене включён: напишу в начале перемены, если кабинет сменится"
+                if p["rooms"] else "🔕 Кабинет на перемене выключен")
     elif act in ("t", "et"):
         await q.answer()
         await _edit(q, TIME_TEXT[kind], time_markup(cid, kind, back))
@@ -2592,6 +2688,7 @@ def menu_markup(chat_id: int = 0) -> InlineKeyboardMarkup:
     B = InlineKeyboardButton
     return InlineKeyboardMarkup([
         [B("📅 Расписание", callback_data="menu:s")],
+        [B("🔔 Звонки", callback_data="menu:b")],
         [B("🔔 Уведомления", callback_data="menu:n")],
         [B(f"🔀 Сравнение с расписанием: {'вкл' if get_cmp(chat_id) else 'выкл'}", callback_data="menu:c")],
         [B("🆘 Помощь", callback_data="menu:h")],
@@ -2625,6 +2722,13 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif act == "s":    # расписание
         track(update, cat="расписание", when=datetime.now(TZ))
         await _edit(q, SCHEDULE_TEXT, schedule_markup(back=True))
+    elif act in ("b", "bt", "bs"):    # расписание звонков: «b» - как сегодня, «bt» - четверг, «bs» - остальные дни
+        track(update, cat="звонки", when=datetime.now(TZ))
+        thu = (datetime.now(TZ).weekday() == 3) if act == "b" else act == "bt"
+        B = InlineKeyboardButton
+        other = B("Другие дни", callback_data="menu:bs") if thu else B("Четверг", callback_data="menu:bt")
+        await _edit(q, bells_message(thu),
+                    InlineKeyboardMarkup([[other], [B(BACK_LABEL, callback_data=MENU_BACK)]]))
     elif act == "n":    # уведомления
         track(update, cat="уведомления", when=datetime.now(TZ))
         await _edit(q, notif_text(cid), notif_markup(cid, back=True))
@@ -3485,6 +3589,7 @@ def admin_markup() -> InlineKeyboardMarkup:
         [B("📋 Ключи", callback_data="adm:keys"), B("👥 Пользователи", callback_data="adm:users")],
         [B("🔓 Выключить проверку ключа" if on else "🔒 Включить проверку ключа", callback_data="adm:toggle")],
         [B("🔇 Выключить рассылку замен" if DATA["broadcast"]["on"] else "📢 Включить рассылку замен", callback_data="adm:bc")],
+        [B("✅ Вернуть кабинеты" if rooms_forced_off() else "🚫 Выключить кабинеты до 00:00", callback_data="adm:rm")],
     ])
 
 
@@ -3497,6 +3602,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🛠 Панель администратора\nПроверка ключа: {'включена 🔒' if on else 'выключена 🔓'}\n"
         f"Рассылка замен: {broadcast_state()}\n"
+        f"Кабинеты на перемене: {'выключены до 00:00 🚫' if rooms_forced_off() else 'работают'} "
+        f"(включено у {len(rooms_subscribers())} чел.)\n"
         f"Сохранение данных: {'авто в GitHub Gist ✅' if _gist_ready else 'только диск ⚠️ (Render может стереть)'}\n\n"
         "Кнопки «🔑» создают одноразовый ключ. Сразу несколько: /key 7d 10",
         reply_markup=admin_markup())
@@ -3542,6 +3649,13 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(grant_report(todo, already, banned, dur))
         if notify:
             await notify_granted(context.bot, todo, dur)
+    elif action == "rm":
+        text = await set_rooms_off(context.bot, not rooms_forced_off())
+        try:
+            await q.message.edit_reply_markup(reply_markup=admin_markup())
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id, text)
     elif action == "bc":
         text = await set_broadcast(not DATA["broadcast"]["on"])
         try:
@@ -3753,6 +3867,198 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_send(context.bot, admin, f"🐞 Ошибка бота{cmd}: {context.error!r}"[:500])
 
 
+
+# ---------- Кабинет на перемене (только личка, у всех выключено) ----------
+# В начале перемены: если кабинет следующей пары не такой, как у предыдущей, человеку приходит сообщение с кабинетом.
+
+ROOM_JOKES = [
+    "Перемена — время менять кабинет. Как жизнь меняет планы: без предупреждения. Но тебя я предупредил.",
+    "Следующая пара в каб. {room}. Бежать не обязательно, но все остальные уже побежали.",
+    "Новый кабинет: {room}. Старый ты всё равно не вернёшь. Двигайся дальше.",
+    "Каб. {room}. Если не придёшь, никто не заметит. Староста заметит.",
+    "Смысл жизни так и не нашёлся, зато нашёлся каб. {room}. Уже кое-что.",
+    "Кабинет {room} ждёт. Преподаватель ждёт. Только ты никуда не торопишься.",
+    "Следующая пара в {room}. Выжить не обещаю, дойти — обязательно.",
+    "Все пути ведут к парам. Твой путь — в каб. {room}.",
+    "Прогул — тоже вариант, но тогда пара придёт за тобой сама. В виде долга. Каб. {room}.",
+    "Следующая остановка: каб. {room}. Конечная — диплом.",
+    "Пока ты читаешь это, время перемены тикает. Беги в каб. {room}.",
+    "Время перемены уходит, как надежды на раннее окончание. Каб. {room}.",
+    "Нет, это не чёрная метка. Это просто новый кабинет — {room}.",
+    "Староста уже там. Ты — ещё нет. Исправь это: каб. {room}.",
+    "Если заблудишься, помни: даже в лабиринте есть выход. А ещё там есть каб. {room}.",
+    "Эволюция: рыба вышла на сушу, студент вышел в коридор. Следующий шаг — каб. {room}.",
+    "Хватит прокрастинировать на перемене. Цель твоей жизни сейчас — каб. {room}.",
+    "Отчисление пока не планируется. Но опоздаешь в {room} — подумаю.",
+    "Пара в {room}. Это не шутка. Хотя шутка тоже, но кабинет настоящий.",
+    "Кто не успел, тот опоздал. Кто опоздал, тот стоит у двери. Каб. {room}.",
+    "Если смерть и придёт за тобой, то с пересдачей. А пока — каб. {room}.",
+    "Не беги, это не поможет: каб. {room} всё равно далеко. Но беги.",
+    "Меняем кабинет, как меняем планы на жизнь: быстро и без согласования. Теперь — {room}.",
+    "Каб. {room}. Тапки в руки — и вперёд. Нет, без тапок.",
+    "В каб. {room} тебя ждёт знание. И преподаватель. Порядок может быть любым.",
+    "Кабинет {room} не кусается. Преподаватель — по ситуации.",
+    "Ещё одна перемена прожита. Ещё один кабинет впереди: {room}. Продолжай в том же духе.",
+    "Говорят, студенты живут от сессии до сессии. Сейчас ты живёшь до каб. {room}.",
+    "Каб. {room}. Не опаздывай: у входа уже образуется очередь из чужих проблем.",
+    "Твоя следующая пара — в {room}. Шансы отсидеть её с умным видом — пятьдесят на пятьдесят.",
+    "Слово дня: «успеть». Где: каб. {room}.",
+    "В коридоре уже толпа, в {room} уже пара. Ты что-то забыл? Нет, просто пора.",
+    "Бесплатный совет: не доверяй расписанию, доверяй мне. Каб. {room}.",
+    "Этот кабинет — {room}. Запомни его, потому что завтра он, возможно, будет другим.",
+    "Спокойно. Паники нет. Есть каб. {room} и время на перемену, которое быстро кончается.",
+    "Пара вот-вот начнётся, а ты всё ещё на перемене. Печально. Каб. {room}.",
+]
+
+
+def _room_text_for(items):
+    """[(преподаватель | None, кабинет)] -> «401» или «Иванов — 401; Петров — 205» (если у подгрупп разные)."""
+    rooms = []
+    for _, r in items:
+        if r not in rooms:
+            rooms.append(r)
+    if len(rooms) == 1:
+        return rooms[0]
+    return "; ".join(f"{t.split()[0] if t else '?'} — {r}" for t, r in items)
+
+
+def lesson_room(day, num, changes, rooms):
+    """Что известно про урок num в день day: (предмет, кабинет | None) или None, если урока нет/снят."""
+    base = SCHEDULE.get(day.weekday(), [])
+    plan = base[num - 1] if num <= len(base) else ""
+    d = changes.get(num)
+    if d:
+        old = fmt(d["os"], d["ot"], d["oa"])
+        new = fmt(d["ns"], d["nt"], d["na"])
+        if new and new != old:  # замена
+            if new.lower().startswith("урок снят"):
+                return None
+            subj = " / ".join(uniq(d["ns"])) or plan
+            teach, auds = uniq(d["nt"]), uniq(d["na"])
+        else:                    # по расписанию, но данные про преподавателя и кабинет есть в файле
+            subj = plan
+            teach, auds = uniq(d["nt"]) or uniq(d["ot"]), uniq(d["na"]) or uniq(d["oa"])
+        if auds:
+            return subj, ", ".join(auds)
+        found = [(t, find_room(t, num, rooms)) for t in teach]
+        found = [(t, r) for t, r in found if r]
+        if found:
+            return subj, _room_text_for(found)
+        if plan and not (new and new != old):
+            sr = subject_room(plan, num, rooms)
+            if sr:
+                return subj, sr[1]
+        return subj, None
+    if not plan:
+        return None
+    sr = subject_room(plan, num, rooms)
+    return plan, (sr[1] if sr else None)
+
+
+def break_triggers(day):
+    """{'HH:MM': номер урока, к которому идти}: начало перемены перед уроком (перед уроком 1 перемены нет).
+    В четверг перед 6 уроком пишем в начале перемены после информационного часа."""
+    b, out = bells_for(day), {}
+    for n in sorted(b):
+        if n == 1:
+            continue
+        if day.weekday() == 3 and n == 6:
+            out[INFO_HOUR_THU[1]] = n
+        elif n - 1 in b:
+            out[b[n - 1][1]] = n
+    return out
+
+
+def room_message(n, subj, room, teacher=None):
+    joke = random.choice(ROOM_JOKES).format(room=room)
+    return f"{joke}\n\n🚪 Урок {n}: {subj}\n📍 Каб. {room}"
+
+
+_rooms_done = {"day": "", "keys": set()}
+
+
+async def rooms_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в минуту: начало перемены - пишем тем, у кого включено, если кабинет следующей пары меняется."""
+    now = datetime.now(TZ)
+    day = now.date()
+    if day.weekday() == 6:
+        return
+    if DATA["rooms_off"].get("day") == day.isoformat():
+        return  # админ выключил кабинеты до 00:00
+    n = break_triggers(day).get(now.strftime("%H:%M"))
+    if not n:
+        return
+    due = rooms_subscribers()  # только личка, группы и каналы не получают
+    if not due:
+        return
+    if _rooms_done["day"] != day.isoformat():
+        _rooms_done["day"], _rooms_done["keys"] = day.isoformat(), set()
+    if n in _rooms_done["keys"]:
+        return
+    _rooms_done["keys"].add(n)  # отмечаем заранее: не высылаем дважды
+    try:
+        item = await asyncio.to_thread(find_pdf, day)
+        changes, rooms = {}, []
+        if item is not None:
+            changes, _, rooms = await asyncio.to_thread(lambda: lessons_of(download(item)))
+    except Exception:  # noqa: BLE001
+        log.exception("кабинет на перемене: не удалось прочитать файл замен")
+        _rooms_done["keys"].discard(n)  # попробуем в следующую минуту
+        return
+    nxt = lesson_room(day, n, changes, rooms)
+    if not nxt or not nxt[1]:
+        return  # урока нет, он снят или кабинет неизвестен
+    cur = lesson_room(day, n - 1, changes, rooms) if n - 1 in bells_for(day) else None
+    if cur and cur[1] and cur[1] == nxt[1]:
+        return  # кабинет не меняется
+    await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due)
+
+
+ROOMS_OFF_TEXT = "По технической причине уведомление о кабинетах принудительно выключено. Кабинеты есть в заменах."
+
+
+def rooms_forced_off() -> bool:
+    return DATA["rooms_off"].get("day") == datetime.now(TZ).date().isoformat()
+
+
+def rooms_subscribers() -> list:
+    """Личные чаты, где включено «кабинет на перемене»."""
+    return [int(cid) for cid, p in DATA["prefs"].items()
+            if p.get("rooms") and cid.lstrip("-").isdigit() and int(cid) > 0]
+
+
+async def set_rooms_off(bot, off: bool) -> str:
+    """Админ: выключить кабинеты на сутки (до 00:00) с уведомлением тем, у кого они включены, или вернуть."""
+    if not off:
+        DATA["rooms_off"] = {"day": ""}
+        save_data()
+        return "✅ Уведомления о кабинетах снова работают."
+    DATA["rooms_off"] = {"day": datetime.now(TZ).date().isoformat()}
+    save_data()
+    ids = rooms_subscribers()
+    if ids:
+        await broadcast(bot, ROOMS_OFF_TEXT, ids=ids)
+    return (f"🚫 Уведомления о кабинетах выключены до 00:00. Предупредил {len(ids)} чел., у кого они включены.\n"
+            "Вернуть раньше: та же кнопка в /admin или /roomsoff.")
+
+
+async def roomsoff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/roomsoff - выключить кабинеты до 00:00 (повторно - вернуть) (только для ADMIN_IDS)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    await update.message.reply_text(await set_rooms_off(context.bot, not rooms_forced_off()), reply_markup=KEYBOARD)
+
+
+async def roomtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/roomtest [кабинет] - админу: показать, как выглядит сообщение о кабинете на перемене."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
+        return
+    room = (context.args or ["401"])[0]
+    await update.message.reply_text(room_message(3, "Основы автоматики", room), reply_markup=KEYBOARD)
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())  # нужно для Python 3.14
     if not ADMIN_IDS:
@@ -3784,6 +4090,8 @@ def main():
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("site", site_cmd))
+    app.add_handler(CommandHandler("roomtest", roomtest_cmd))
+    app.add_handler(CommandHandler("roomsoff", roomsoff_cmd))
     app.add_handler(CommandHandler("setfile", setfile_cmd))
     app.add_handler(CommandHandler("clearfiles", clearfiles_cmd))
     app.add_handler(CommandHandler("groups", groups_cmd))
@@ -3813,6 +4121,7 @@ def main():
         log.warning("JobQueue недоступен: установите python-telegram-bot[job-queue,webhooks]")
     else:
         app.job_queue.run_repeating(watch_job, interval=CHECK_FAST, first=30)
+        app.job_queue.run_repeating(rooms_job, interval=60, first=15)  # кабинет на перемене (кому включено)
         app.job_queue.run_repeating(morning_job, interval=60, first=20)  # расписание на день, у каждого своё время
         app.job_queue.run_repeating(evening_job, interval=60, first=25)  # расписание на завтра, у каждого своё время
         app.job_queue.run_repeating(access_job, interval=60, first=45)          # конец доступа по ключу
