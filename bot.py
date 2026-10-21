@@ -4183,9 +4183,7 @@ def rooms_now(day, now=None):
     def line(n, cur_room):
         sl = slots[n]
         r = f"🚪 {room_html(sl['room'])}" if sl["room"] else "🚪 кабинет не указан"
-        mark = (f"  🔀 <i>было {esc_html(room_str(cur_room))}</i>"
-                if cur_room and sl["room"] and cur_room != sl["room"] else "")
-        return f"{esc_html(sl['subj'])}\n{r}{mark}"
+        return f"{esc_html(sl['subj'])}\n{r}"
 
     if day != now.date():  # другой день: все пары дня коротко
         out = [f"📅 <b>{DAYS[day.weekday()].capitalize()}, {day:%d.%m}</b>", ""]
@@ -4193,11 +4191,9 @@ def rooms_now(day, now=None):
             ns, g = e["ns"], e["g"]
             label = f"Урок {ns[0]}" if len(ns) == 1 else f"Уроки {ns[0]}–{ns[-1]}"
             if g["cancel"]:
-                out.append(f"❌ <b>{label}:</b> урок снят")
                 continue
             r = room_html(g["room"]) if g["room"] else "кабинет не указан"
-            mark = f"  🔀 <i>было {esc_html(room_str(e['from']))}</i>" if e["from"] else ""
-            out.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}:</b> {esc_html(g['subj'])}\n🚪 {r}{mark}\n")
+            out.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}:</b> {esc_html(g['subj'])}\n🚪 {r}\n")
         if len(out) == 2:
             out.append("Занятий нет")
         if item is None:
@@ -4252,10 +4248,6 @@ def rooms_view(day, now=None):
         wait = _mins(b[m][0]) - cur_min if day == now.date() else None
         when = f"в {_hm(b[m][0])}" + (f" (через {wait} мин)" if wait is not None and wait >= 0 else "")
         txt = f"{head} урок {m} {when}\n   {_where(sl['subj'], sl['room'])}"
-        if cur_room and sl["room"]:
-            txt += (f"\n   🔀 Смена кабинета: <b>{esc_html(cur_room)}</b> → <b>{esc_html(sl['room'])}</b>"
-                    if cur_room != sl["room"]
-                    else "\n   ✅ Кабинет тот же")
         return txt
 
     if day == now.date():
@@ -4305,19 +4297,14 @@ def rooms_view(day, now=None):
             lines.append(info_line + "\n")
             info_done = True
         if g["cancel"]:
-            lines.append(f"❌ <b>{label}</b>: урок снят\n")
             continue
-        mark = ""
-        if e["from"]:
-            mark, any_change = f" 🔀 (было {esc_html(room_str(e['from']))})", True
-        lines.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}</b>:\n{_where(g['subj'], g['room'])}{mark}\n")
+        lines.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}</b>:\n{_where(g['subj'], g['room'])}\n")
     if info_line and not info_done:
         lines.append(info_line)
-    if not slots:
+    if not alive:
         lines.append("Занятий нет.")
-    lines += ["", "🔀 — кабинет меняется · 🔄 — замена"]
-    if any_change:
-        lines.append("Напомнить про новый кабинет в начале перемены: «⚙️ Другое» → «🔔 Уведомления» → «Кабинет на перемене».")
+    else:
+        lines += ["🔄 — замена"]
     if item is None:
         lines.append("ℹ️ Файл замен на этот день пока не найден: показано по расписанию и постоянным кабинетам преподавателей.")
     return "\n".join(lines)
