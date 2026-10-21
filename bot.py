@@ -104,7 +104,7 @@ log = logging.getLogger("zameny")
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
              if x.lstrip("-").isdigit()}
-CHECK_FAST = 60                       # частая проверка (сек): пн-сб в рабочие часы
+CHECK_FAST = max(1, int(os.environ.get("CHECK_FAST", "60")))  # частая проверка (сек): пн-сб в рабочие часы; на Render: CHECK_FAST=10
 CHECK_SLOW = 300                      # обычная проверка (сек): в остальное время
 FAST_FROM = dtime(8, 0)               # частая проверка с ...
 FAST_TO = dtime(16, 0)                # ... до (не включая)
@@ -685,24 +685,79 @@ def _norm(s):
     return s.lower().replace("ё", "е")
 
 
+ROOM_TOK = (r"(?:(?:ауд|каб|кабинет|к)\b\.?\s*)?"
+            r"(\d[\w\-/]*|спорт\.?\s?зал\w*|акт\.?\s?зал\w*|[а-яё]*зал\w*)")
+_INIT = r"((?:\s+[А-ЯЁ]\.\s?(?:[А-ЯЁ]\.)?)?)"
+# формат 1: «Горбова Г.И. 402 (3-6)»: кабинет ПЕРЕД скобками с уроками
+NAME_ROOM = re.compile(rf"({_NAME}){_INIT}\s+{ROOM_TOK}\s*\(([^()]*)\)", re.I)
+# продолжение: «307 (7-8)» без фамилии - тот же преподаватель, другой кабинет на других уроках
+ROOM_ONLY = re.compile(rf"(?<![\w.]){ROOM_TOK}\s*\(([^()]*)\)", re.I)
+NAME_ONLY = re.compile(rf"^\s*({_NAME}){_INIT}\s*$")
+
+
+def _lesson_set(s):
+    """Номера уроков из скобок; «общ»/«все» (без цифр) - все уроки дня."""
+    nums = parse_lesson_set(s)
+    if not nums and re.search(r"общ|все", s, re.I):
+        nums = set(range(1, 13))
+    return nums
+
+
+def _room_text(r):
+    return re.sub(r"\s+", " ", r.strip())
+
+
 def parse_rooms(tails):
-    """Список записей [{'name', 'init', 'lessons', 'room'}] из текста справа от таблицы."""
+    """Список записей [{'name', 'init', 'lessons', 'room'}] из текста справа от таблицы.
+    Понимает оба вида записи: «Горбова Г.И. 402 (3-6)» и «Иванов И.И. (1-4, 6) 205»."""
     out = []
+    last = None  # (фамилия, инициалы) для строк-продолжений вида «307 (7-8)»
     for ln in tails:
-        found = list(ENTRY.finditer(ln))
-        prev_end = 0
+        ln = ln.strip()
+        n_before = len(out)
+        found = list(NAME_ROOM.finditer(ln))
         for m in found:
+            lessons = _lesson_set(m.group(4))
+            last = (_norm(m.group(1)), re.sub(r"[^а-яё]", "", _norm(m.group(2))))
+            if lessons:
+                out.append({"name": last[0], "init": last[1], "lessons": lessons, "room": _room_text(m.group(3))})
+            # остаток строки после первой записи: «... 307 (7-8)» - ещё кабинеты того же преподавателя
+            rest_from = m.end()
+            for m2 in ROOM_ONLY.finditer(ln, rest_from):
+                if any(f.start() <= m2.start() < f.end() for f in found):
+                    continue
+                les2 = _lesson_set(m2.group(2))
+                if les2:
+                    out.append({"name": last[0], "init": last[1], "lessons": les2, "room": _room_text(m2.group(1))})
+        if found:
+            continue
+        mo = NAME_ONLY.match(ln)
+        if mo:  # строка только с фамилией: кабинеты будут на следующей строке
+            last = (_norm(mo.group(1)), re.sub(r"[^а-яё]", "", _norm(mo.group(2))))
+            continue
+        cont = list(ROOM_ONLY.finditer(ln)) if last and not ENTRY.search(ln) else []
+        for m2 in cont:
+            les2 = _lesson_set(m2.group(2))
+            if les2:
+                out.append({"name": last[0], "init": last[1], "lessons": les2, "room": _room_text(m2.group(1))})
+        if cont:
+            continue
+        # формат 2 (старый): «Иванов И.И. (1-4, 6) 205»
+        prev_end = 0
+        found2 = list(ENTRY.finditer(ln))
+        for m in found2:
             lessons = parse_lesson_set(m.group(3))
             rm = ROOM_AFTER.match(ln[m.end():])
             room = rm.group(1).strip() if rm else None
-            if room is None and len(found) == 1:  # кабинет мог стоять перед фамилией
+            if room is None and len(found2) == 1:  # кабинет мог стоять перед фамилией
                 before = ROOM_ANY.findall(ln[prev_end:m.start()])
                 room = before[-1] if before else None
             prev_end = m.end()
+            last = (_norm(m.group(1)), re.sub(r"[^а-яё]", "", _norm(m.group(2))))
             if lessons and room:
-                out.append({"name": _norm(m.group(1)),
-                            "init": re.sub(r"[^а-яё]", "", _norm(m.group(2))),
-                            "lessons": lessons, "room": room})
+                out.append({"name": last[0], "init": last[1], "lessons": lessons, "room": room})
+        if not found2 and len(out) == n_before:
+            last = None  # посторонняя строка: продолжение больше не относится к прошлой фамилии
     return out
 
 
@@ -2310,7 +2365,7 @@ async def _edit(q, text, markup):
     try:
         await q.edit_message_text(text, reply_markup=markup)
     except BadRequest as e:
-        if "not modified" not in str(e).lower():
+        if not any(m in str(e).lower() for m in HARMLESS_TG):
             raise
 
 
@@ -3604,8 +3659,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _last_err = [0.0]
 
 
+HARMLESS_TG = ("message to edit not found", "message is not modified", "query is too old",
+               "query id is invalid", "message can't be edited", "message to delete not found")
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Ошибка в обработчике", exc_info=context.error)
+    err = context.error
+    if isinstance(err, BadRequest) and any(m in str(err).lower() for m in HARMLESS_TG):
+        log.info("пропущена безобидная ошибка Telegram: %r", err)  # сообщение уже удалено/старое: админу не пишем
+        return
+    log.error("Ошибка в обработчике", exc_info=err)
     now = time.time()
     if now - _last_err[0] < 30:  # не чаще раза в 30 секунд
         return
