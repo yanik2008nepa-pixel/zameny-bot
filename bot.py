@@ -4080,8 +4080,22 @@ async def roomcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines)[:4000], reply_markup=KEYBOARD)
 
 
-def rooms_view(day):
-    """Кабинеты и время по парам на день с учётом замен. Где кабинет меняется - 🔀, замена - 🔄."""
+def _mins(hhmm):
+    return int(hhmm[:2]) * 60 + int(hhmm[3:])
+
+
+def _hm(hhmm):
+    return hhmm.lstrip("0")
+
+
+def _where(subj, room):
+    return f"{subj}, " + (f"каб. {room}" if room else "кабинет не указан")
+
+
+def rooms_view(day, now=None):
+    """Кабинеты по парам на день с учётом замен и (для сегодняшнего дня) с привязкой к текущему времени:
+    что сейчас, куда идти дальше и меняется ли кабинет. 🔀 - смена кабинета, 🔄 - замена."""
+    now = now or datetime.now(TZ)
     item = find_pdf(day)
     changes, info, rooms = {}, None, []
     if item is not None:
@@ -4089,38 +4103,118 @@ def rooms_view(day):
     b = bells_for(day)
     base = SCHEDULE.get(day.weekday(), [])
     last = max([len(base)] + list(changes))
-    lines = [f"🚪 Кабинеты на {day:%d.%m.%Y} ({DAYS[day.weekday()]}), с учётом замен", ""]
-    prev, any_change, info_done = None, False, False
-    info_line = (f"🕐 Информационный час ({INFO_HOUR_THU[0].lstrip('0')}–{INFO_HOUR_THU[1].lstrip('0')}): {info}"
-                 if info and day.weekday() == 3 else None)
+
+    # --- все уроки дня одним списком
+    slots = {}
     for n in range(1, last + 1):
-        if info_line and n == 6:  # в четверг информационный час стоит между 5 и 6 уроком
-            lines.append(info_line)
-            info_done = True
-        t = f" ({b[n][0].lstrip('0')}–{b[n][1].lstrip('0')})" if n in b else ""
-        lr = lesson_room(day, n, changes, rooms)
         d = changes.get(n)
+        lr = lesson_room(day, n, changes, rooms)
         if not lr:
             if d and fmt(d["ns"], d["nt"], d["na"]).lower().startswith("урок снят"):
-                lines.append(f"❌ Урок {n}{t}: урок снят")
+                slots[n] = {"n": n, "cancel": True, "subj": "", "room": None, "replaced": False}
             continue
-        subj, room = lr
-        replaced = bool(d and fmt(d["ns"], d["nt"], d["na"]) and
-                        fmt(d["ns"], d["nt"], d["na"]) != fmt(d["os"], d["ot"], d["oa"]))
-        mark = ""
-        if room and prev and room != prev:
-            mark, any_change = f" 🔀 (было каб. {prev})", True
-        lines.append(f"{'🔄 ' if replaced else ''}Урок {n}{t}: {subj} — "
-                     + (f"каб. {room}" if room else "кабинет не указан") + mark)
-        prev = room
+        new_t = fmt(d["ns"], d["nt"], d["na"]) if d else ""
+        replaced = bool(d and new_t and new_t != fmt(d["os"], d["ot"], d["oa"]))
+        slots[n] = {"n": n, "cancel": False, "subj": lr[0], "room": lr[1], "replaced": replaced}
+    alive = [n for n in sorted(slots) if not slots[n]["cancel"]]
+
+    def tm(n):
+        return f"{_hm(b[n][0])}–{_hm(b[n][1])}" if n in b else ""
+
+    lines = [f"🚪 Кабинеты на {day:%d.%m.%Y} ({DAYS[day.weekday()]}), с учётом замен", ""]
+
+    # --- блок «сейчас» (только для сегодняшнего дня; для других дней - «первая пара»)
+    cur_min = now.hour * 60 + now.minute
+
+    def nxt_line(after_n, cur_room, head):
+        """Строка про следующую живую пару после урока after_n (или первую, если after_n=None)."""
+        m = next((k for k in alive if after_n is None or k > after_n), None)
+        if m is None or m not in b:
+            return None
+        sl = slots[m]
+        wait = _mins(b[m][0]) - cur_min if day == now.date() else None
+        when = f"в {_hm(b[m][0])}" + (f" (через {wait} мин)" if wait is not None and wait >= 0 else "")
+        txt = f"{head} урок {m} {when}\n   {_where(sl['subj'], sl['room'])}"
+        if cur_room and sl["room"]:
+            txt += (f"\n   🔀 Смена кабинета: {cur_room} → {sl['room']}" if cur_room != sl["room"]
+                    else "\n   ✅ Кабинет тот же")
+        return txt
+
+    if day == now.date():
+        hh = f"{now:%H:%M}"
+        status, want_next, after, cur_room = None, True, None, None
+        in_lesson = next((n for n in alive if n in b and _mins(b[n][0]) <= cur_min < _mins(b[n][1])), None)
+        done = [k for k in alive if k in b and _mins(b[k][1]) <= cur_min]
+        coming = [k for k in alive if k in b and _mins(b[k][0]) > cur_min]
+        if in_lesson:
+            left = _mins(b[in_lesson][1]) - cur_min
+            sl = slots[in_lesson]
+            status = (f"📍 Сейчас {hh}: идёт урок {in_lesson} (до {_hm(b[in_lesson][1])}, осталось {left} мин)\n"
+                      f"   {_where(sl['subj'], sl['room'])}")
+            after, cur_room = in_lesson, sl["room"]
+        elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
+            status = f"📍 Сейчас {hh}: информационный час (до {_hm(INFO_HOUR_THU[1])})\n   {info}"
+            after = done[-1] if done else None
+            cur_room = slots[after]["room"] if after else None
+        elif not coming:
+            status = (f"📍 Сейчас {hh}: на сегодня занятия закончились 🎉" if done
+                      else f"📍 Сейчас {hh}: занятий сегодня нет")
+            want_next = False
+        else:
+            status = f"📍 Сейчас {hh}: перемена" if done else f"📍 Сейчас {hh}: занятия ещё не начались"
+            after = done[-1] if done else None
+            cur_room = slots[after]["room"] if after else None
+        lines.append(status)
+        if want_next:
+            nl = nxt_line(after, cur_room, "➡️ Дальше:")
+            if nl:
+                lines.append(nl)
+            elif in_lesson:
+                lines.append("🏁 Это последняя пара на сегодня")
+        lines.append("")
+    else:
+        nl = nxt_line(None, None, "➡️ Первая пара:")
+        if nl:
+            lines += [nl, ""]
+
+    # --- по парам: 1-2, 3-4, 5-6, ...; в паре разные кабинеты - показываем уроки отдельно
+    prev = None
+    info_done = False
+    info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])}): {info}"
+                 if info and day.weekday() == 3 else None)
+    any_change = False
+    for first in range(1, last + 1, 2):
+        grp = [slots[n] for n in (first, first + 1) if n in slots]
+        if not grp:
+            continue
+        same = len(grp) == 2 and all(
+            (g["cancel"], g["subj"], g["room"], g["replaced"]) == (grp[0]["cancel"], grp[0]["subj"], grp[0]["room"], grp[0]["replaced"])
+            for g in grp)
+        parts = [grp] if same else [[g] for g in grp]
+        for part in parts:
+            ns = [g["n"] for g in part]
+            label = f"Урок {ns[0]}" if len(ns) == 1 else f"Уроки {ns[0]}–{ns[-1]}"
+            times = ", ".join(tm(n) for n in ns if tm(n))
+            label += f" ({times})" if times else ""
+            g = part[0]
+            if info_line and not info_done and ns[0] >= 6:
+                lines.append(info_line)
+                info_done = True
+            if g["cancel"]:
+                lines.append(f"❌ {label}: урок снят")
+                continue
+            mark = ""
+            if g["room"] and prev and g["room"] != prev:
+                mark, any_change = f" 🔀 (было каб. {prev})", True
+            lines.append(f"{'🔄 ' if g['replaced'] else ''}{label}: {_where(g['subj'], g['room'])}{mark}")
+            prev = g["room"]
     if info_line and not info_done:
         lines.append(info_line)
-    if len(lines) == 2:
+    if not slots:
         lines.append("Занятий нет.")
-    lines.append("")
-    lines.append("🔀 — кабинет меняется · 🔄 — замена")
+    lines += ["", "🔀 — кабинет меняется · 🔄 — замена"]
     if any_change:
-        lines.append("В начале перемены могу напомнить про новый кабинет: «⚙️ Другое» → «🔔 Уведомления» → «Кабинет на перемене».")
+        lines.append("Напомнить про новый кабинет в начале перемены: «⚙️ Другое» → «🔔 Уведомления» → «Кабинет на перемене».")
     if item is None:
         lines.append("ℹ️ Файл замен на этот день пока не найден: показано по расписанию и постоянным кабинетам преподавателей.")
     return "\n".join(lines)
