@@ -43,7 +43,7 @@ import re
 import secrets
 import threading
 import time
-from html import unescape
+from html import escape as esc_html, unescape
 from html.parser import HTMLParser
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -2525,9 +2525,9 @@ async def toggle_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(notif_text(cid), reply_markup=notif_markup(cid))
 
 
-async def _edit(q, text, markup):
+async def _edit(q, text, markup, parse_mode=None):
     try:
-        await q.edit_message_text(text, reply_markup=markup)
+        await q.edit_message_text(text, reply_markup=markup, parse_mode=parse_mode)
     except BadRequest as e:
         if not any(m in str(e).lower() for m in HARMLESS_TG):
             raise
@@ -2742,7 +2742,7 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:  # noqa: BLE001
             log.exception("кабинеты: не удалось собрать")
             text = "Не получилось получить кабинеты 😕 Попробуй чуть позже или открой «Пары»."
-        await _edit(q, text[:4000], kb)
+        await _edit(q, text[:4000], kb, parse_mode="HTML")
     elif act in ("b", "bt", "bs"):    # расписание звонков: «b» - как сегодня, «bt» - четверг, «bs» - остальные дни
         track(update, cat="звонки", when=datetime.now(TZ))
         thu = (datetime.now(TZ).weekday() == 3) if act == "b" else act == "bt"
@@ -2785,7 +2785,7 @@ async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(SUB_OFF, reply_markup=KEYBOARD)
 
 
-async def broadcast(bot, text: str, ids=None, imgs=None):
+async def broadcast(bot, text: str, ids=None, imgs=None, parse_mode=None):
     """Рассылка: по умолчанию тем, у кого включены замены; можно передать свой список id.
     imgs - JPEG-страницы файла замен: если есть, фото уходит следом, ниже текста.
     Если text пустой (None или ""), отправляются только фото, без текста."""
@@ -2794,7 +2794,7 @@ async def broadcast(bot, text: str, ids=None, imgs=None):
             continue
         if text:
             try:
-                await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD)
+                await bot.send_message(cid, text[:4000], reply_markup=KEYBOARD, parse_mode=parse_mode)
             except (Forbidden, BadRequest):  # бота заблокировали / чата нет
                 set_sub(cid, False)
                 continue
@@ -3991,8 +3991,9 @@ def break_triggers(day):
 
 
 def room_message(n, subj, room, teacher=None):
-    joke = random.choice(ROOM_JOKES).format(room=room)
-    return f"{joke}\n\n🚪 Урок {n}: {subj}\n📍 Каб. {room}"
+    """Текст в формате HTML (отправлять с parse_mode="HTML"): номер кабинета выделен жирным."""
+    joke = random.choice(ROOM_JOKES).format(room=f"<b>{esc_html(room)}</b>")
+    return f"{joke}\n\n🚪 Урок {n}: {esc_html(subj)}\n\n📍 Каб. <b>{esc_html(room)}</b>"
 
 
 _rooms_done = {"day": "", "keys": set()}
@@ -4049,7 +4050,7 @@ async def rooms_job(context: ContextTypes.DEFAULT_TYPE):
         send, nxt, cur, why = room_decision(day, n, changes, rooms)
         log.info("кабинет на перемене, урок %s: %s (%s), получателей %s", n, "пишу" if send else "молчу", why, len(due))
         if send:
-            await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due)
+            await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due, parse_mode="HTML")
 
 
 async def roomcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4093,7 +4094,8 @@ def _hm(hhmm):
 
 
 def _where(subj, room):
-    return f"{subj}, " + (f"каб. {room}" if room else "кабинет не указан")
+    """Предмет и кабинет (HTML): номер кабинета жирным."""
+    return f"{esc_html(subj)}, " + (f"каб. <b>{esc_html(room)}</b>" if room else "кабинет не указан")
 
 
 def _rooms_prep(day):
@@ -4121,45 +4123,46 @@ def _rooms_prep(day):
 
 
 def rooms_now(day, now=None):
-    """Коротко: время, текущая пара и кабинет, следующая пара. Для не сегодняшнего дня - первая пара."""
+    """Коротко (HTML): время, текущая пара и кабинет, следующая пара. Для не сегодняшнего дня - первая пара."""
     now = now or datetime.now(TZ)
     item, changes, info, rooms, slots, alive, b, last = _rooms_prep(day)
     cur_min = now.hour * 60 + now.minute
 
     def line(n, cur_room):
         sl = slots[n]
-        r = f"каб. {sl['room']}" if sl["room"] else "кабинет не указан"
-        mark = f" 🔀 (было {cur_room})" if cur_room and sl["room"] and cur_room != sl["room"] else ""
-        return f"{sl['subj']} — {r}{mark}"
+        r = f"🚪 каб. <b>{esc_html(sl['room'])}</b>" if sl["room"] else "🚪 кабинет не указан"
+        mark = (f"  🔀 <i>было {esc_html(cur_room)}</i>"
+                if cur_room and sl["room"] and cur_room != sl["room"] else "")
+        return f"{esc_html(sl['subj'])}\n{r}{mark}"
 
     if day != now.date():
         first = next((n for n in alive if n in b), None)
-        out = [f"📅 {DAYS[day.weekday()].capitalize()}, {day:%d.%m}"]
-        out.append(f"Первая пара (в {_hm(b[first][0])}): {line(first, None)}" if first else "Занятий нет")
+        out = [f"📅 <b>{DAYS[day.weekday()].capitalize()}, {day:%d.%m}</b>", ""]
+        out.append(f"<b>Первая пара</b> (в {_hm(b[first][0])}):\n{line(first, None)}" if first else "Занятий нет")
         return "\n".join(out)
 
     in_lesson = next((n for n in alive if n in b and _mins(b[n][0]) <= cur_min < _mins(b[n][1])), None)
     done = [k for k in alive if k in b and _mins(b[k][1]) <= cur_min]
     coming = [k for k in alive if k in b and _mins(b[k][0]) > cur_min]
-    out = [f"🕐 {now:%H:%M}"]
+    out = [f"🕐 <b>{now:%H:%M}</b>", ""]
     cur_room = None
     if in_lesson:
-        out.append(f"Сейчас: {line(in_lesson, None)}")
+        out.append(f"<b>Сейчас:</b> {line(in_lesson, None)}")
         cur_room = slots[in_lesson]["room"]
     elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
-        out.append(f"Сейчас: информационный час — {info}")
+        out.append(f"<b>Сейчас:</b> информационный час\n🚪 {esc_html(info)}")
         cur_room = slots[done[-1]]["room"] if done else None
     elif not coming:
         out.append("Занятия на сегодня закончились 🎉" if done else "Занятий сегодня нет")
         return "\n".join(out)
     else:
-        out.append("Сейчас: перемена" if done else "Занятия ещё не начались")
+        out.append("<b>Сейчас:</b> перемена" if done else "Занятия ещё не начались")
         cur_room = slots[done[-1]]["room"] if done else None
     nxt = next((k for k in coming), None)
     if nxt:
-        out.append(f"Дальше (в {_hm(b[nxt][0])}): {line(nxt, cur_room)}")
+        out += ["", f"<b>Дальше</b> (в {_hm(b[nxt][0])}):\n{line(nxt, cur_room)}"]
     elif in_lesson:
-        out.append("Это последняя пара на сегодня")
+        out += ["", "🏁 Это последняя пара на сегодня"]
     return "\n".join(out)
 
 
@@ -4187,7 +4190,8 @@ def rooms_view(day, now=None):
         when = f"в {_hm(b[m][0])}" + (f" (через {wait} мин)" if wait is not None and wait >= 0 else "")
         txt = f"{head} урок {m} {when}\n   {_where(sl['subj'], sl['room'])}"
         if cur_room and sl["room"]:
-            txt += (f"\n   🔀 Смена кабинета: {cur_room} → {sl['room']}" if cur_room != sl["room"]
+            txt += (f"\n   🔀 Смена кабинета: <b>{esc_html(cur_room)}</b> → <b>{esc_html(sl['room'])}</b>"
+                    if cur_room != sl["room"]
                     else "\n   ✅ Кабинет тот же")
         return txt
 
@@ -4204,7 +4208,7 @@ def rooms_view(day, now=None):
                       f"   {_where(sl['subj'], sl['room'])}")
             after, cur_room = in_lesson, sl["room"]
         elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
-            status = f"📍 Сейчас {hh}: информационный час (до {_hm(INFO_HOUR_THU[1])})\n   {info}"
+            status = f"📍 Сейчас {hh}: информационный час (до {_hm(INFO_HOUR_THU[1])})\n   {esc_html(info)}"
             after = done[-1] if done else None
             cur_room = slots[after]["room"] if after else None
         elif not coming:
@@ -4231,7 +4235,7 @@ def rooms_view(day, now=None):
     # --- по парам: 1-2, 3-4, 5-6, ...; в паре разные кабинеты - показываем уроки отдельно
     prev = None
     info_done = False
-    info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])}): {info}"
+    info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])}): {esc_html(info)}"
                  if info and day.weekday() == 3 else None)
     any_change = False
     for first in range(1, last + 1, 2):
@@ -4249,15 +4253,15 @@ def rooms_view(day, now=None):
             label += f" ({times})" if times else ""
             g = part[0]
             if info_line and not info_done and ns[0] >= 6:
-                lines.append(info_line)
+                lines.append(info_line + "\n")
                 info_done = True
             if g["cancel"]:
-                lines.append(f"❌ {label}: урок снят")
+                lines.append(f"❌ <b>{label}</b>: урок снят\n")
                 continue
             mark = ""
             if g["room"] and prev and g["room"] != prev:
-                mark, any_change = f" 🔀 (было каб. {prev})", True
-            lines.append(f"{'🔄 ' if g['replaced'] else ''}{label}: {_where(g['subj'], g['room'])}{mark}")
+                mark, any_change = f" 🔀 (было каб. {esc_html(prev)})", True
+            lines.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}</b>:\n{_where(g['subj'], g['room'])}{mark}\n")
             prev = g["room"]
     if info_line and not info_done:
         lines.append(info_line)
@@ -4313,7 +4317,8 @@ async def roomtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(not_admin_text(update))
         return
     room = (context.args or ["401"])[0]
-    await update.message.reply_text(room_message(3, "Основы автоматики", room), reply_markup=KEYBOARD)
+    await update.message.reply_text(room_message(3, "Основы автоматики", room), reply_markup=KEYBOARD,
+                                    parse_mode="HTML")
 
 
 def main():
