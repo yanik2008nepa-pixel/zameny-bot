@@ -2724,17 +2724,21 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif act == "s":    # расписание
         track(update, cat="расписание", when=datetime.now(TZ))
         await _edit(q, SCHEDULE_TEXT, schedule_markup(back=True))
-    elif act in ("k", "kt"):    # кабинеты на сегодня / на завтра с учётом замен
+    elif act in ("k", "kt", "kd", "kdt"):    # кабинеты: k - сейчас, kt - завтра, kd/kdt - весь день (сегодня/завтра)
         track(update, cat="кабинеты", when=datetime.now(TZ))
         today = datetime.now(TZ).date()
-        day = next_workday(today) if (act == "kt" or today.weekday() == 6) else today
+        tomorrow = act in ("kt", "kdt") or today.weekday() == 6
+        day = next_workday(today) if tomorrow else today
+        full = act in ("kd", "kdt")
         B = InlineKeyboardButton
-        other = (B("Сегодня", callback_data="menu:k") if act == "kt" or today.weekday() == 6 else
-                 B("Завтра", callback_data="menu:kt"))
-        kb = InlineKeyboardMarkup([[other], [B(BACK_LABEL, callback_data=MENU_BACK)]])
+        row1 = [B("🔄 Обновить", callback_data=f"menu:{act}")]
+        row1.append(B("Завтра", callback_data="menu:kt") if not tomorrow else B("Сегодня", callback_data="menu:k"))
+        row2 = [B("📋 Весь день" if not full else "⏱ Коротко",
+                  callback_data=("menu:kd" if not tomorrow else "menu:kdt") if not full else ("menu:k" if not tomorrow else "menu:kt"))]
+        kb = InlineKeyboardMarkup([row1, row2, [B(BACK_LABEL, callback_data=MENU_BACK)]])
         await _edit(q, "⏳ Смотрю замены…", kb)
         try:
-            text = await asyncio.to_thread(rooms_view, day)
+            text = await asyncio.to_thread(rooms_view if full else rooms_now, day)
         except Exception:  # noqa: BLE001
             log.exception("кабинеты: не удалось собрать")
             text = "Не получилось получить кабинеты 😕 Попробуй чуть позже или открой «Пары»."
@@ -4092,10 +4096,8 @@ def _where(subj, room):
     return f"{subj}, " + (f"каб. {room}" if room else "кабинет не указан")
 
 
-def rooms_view(day, now=None):
-    """Кабинеты по парам на день с учётом замен и (для сегодняшнего дня) с привязкой к текущему времени:
-    что сейчас, куда идти дальше и меняется ли кабинет. 🔀 - смена кабинета, 🔄 - замена."""
-    now = now or datetime.now(TZ)
+def _rooms_prep(day):
+    """Данные дня: файл замен, замены, инфо-час, кабинеты панели, уроки (slots), живые уроки, звонки, число уроков."""
     item = find_pdf(day)
     changes, info, rooms = {}, None, []
     if item is not None:
@@ -4103,8 +4105,6 @@ def rooms_view(day, now=None):
     b = bells_for(day)
     base = SCHEDULE.get(day.weekday(), [])
     last = max([len(base)] + list(changes))
-
-    # --- все уроки дня одним списком
     slots = {}
     for n in range(1, last + 1):
         d = changes.get(n)
@@ -4117,6 +4117,57 @@ def rooms_view(day, now=None):
         replaced = bool(d and new_t and new_t != fmt(d["os"], d["ot"], d["oa"]))
         slots[n] = {"n": n, "cancel": False, "subj": lr[0], "room": lr[1], "replaced": replaced}
     alive = [n for n in sorted(slots) if not slots[n]["cancel"]]
+    return item, changes, info, rooms, slots, alive, b, last
+
+
+def rooms_now(day, now=None):
+    """Коротко: время, текущая пара и кабинет, следующая пара. Для не сегодняшнего дня - первая пара."""
+    now = now or datetime.now(TZ)
+    item, changes, info, rooms, slots, alive, b, last = _rooms_prep(day)
+    cur_min = now.hour * 60 + now.minute
+
+    def line(n, cur_room):
+        sl = slots[n]
+        r = f"каб. {sl['room']}" if sl["room"] else "кабинет не указан"
+        mark = f" 🔀 (было {cur_room})" if cur_room and sl["room"] and cur_room != sl["room"] else ""
+        return f"{sl['subj']} — {r}{mark}"
+
+    if day != now.date():
+        first = next((n for n in alive if n in b), None)
+        out = [f"📅 {DAYS[day.weekday()].capitalize()}, {day:%d.%m}"]
+        out.append(f"Первая пара (в {_hm(b[first][0])}): {line(first, None)}" if first else "Занятий нет")
+        return "\n".join(out)
+
+    in_lesson = next((n for n in alive if n in b and _mins(b[n][0]) <= cur_min < _mins(b[n][1])), None)
+    done = [k for k in alive if k in b and _mins(b[k][1]) <= cur_min]
+    coming = [k for k in alive if k in b and _mins(b[k][0]) > cur_min]
+    out = [f"🕐 {now:%H:%M}"]
+    cur_room = None
+    if in_lesson:
+        out.append(f"Сейчас: {line(in_lesson, None)}")
+        cur_room = slots[in_lesson]["room"]
+    elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
+        out.append(f"Сейчас: информационный час — {info}")
+        cur_room = slots[done[-1]]["room"] if done else None
+    elif not coming:
+        out.append("Занятия на сегодня закончились 🎉" if done else "Занятий сегодня нет")
+        return "\n".join(out)
+    else:
+        out.append("Сейчас: перемена" if done else "Занятия ещё не начались")
+        cur_room = slots[done[-1]]["room"] if done else None
+    nxt = next((k for k in coming), None)
+    if nxt:
+        out.append(f"Дальше (в {_hm(b[nxt][0])}): {line(nxt, cur_room)}")
+    elif in_lesson:
+        out.append("Это последняя пара на сегодня")
+    return "\n".join(out)
+
+
+def rooms_view(day, now=None):
+    """Кабинеты по парам на день с учётом замен и (для сегодняшнего дня) с привязкой к текущему времени:
+    что сейчас, куда идти дальше и меняется ли кабинет. 🔀 - смена кабинета, 🔄 - замена."""
+    now = now or datetime.now(TZ)
+    item, changes, info, rooms, slots, alive, b, last = _rooms_prep(day)
 
     def tm(n):
         return f"{_hm(b[n][0])}–{_hm(b[n][1])}" if n in b else ""
