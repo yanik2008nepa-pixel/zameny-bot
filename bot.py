@@ -1869,8 +1869,9 @@ def make_reply(day: date, debug: bool = False, fun_on: bool = False, compare: bo
 
 
 def lessons_of(pdf_bytes: bytes):
-    """Замены группы по номерам уроков и инфо-час: ({урок: данные}, инфо-час | None)."""
-    found, info = None, None
+    """Замены группы по номерам уроков, инфо-час и кабинеты преподавателей из боковой панели:
+    ({урок: данные}, инфо-час | None, [кабинеты])."""
+    found, info, rooms = None, None, []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             lines = page_lines(page)
@@ -1881,13 +1882,15 @@ def lessons_of(pdf_bytes: bytes):
                 continue
             lessons, raw, _ = collect_group(rows, GROUP_CODE)
             info = info or info_hour(tails)
+            rooms += parse_rooms(tails)
             if raw and found is None:
                 found = lessons
-    return found or {}, info
+    return found or {}, info, rooms
 
 
-def merge_day(day: date, changes: dict):
-    """Расписание дня с наложенными заменами: [(номера уроков, текст, было | None)]."""
+def merge_day(day: date, changes: dict, rooms=None):
+    """Расписание дня с наложенными заменами: [(номера уроков, текст, было | None)].
+    У заменённых пар кабинет берётся из таблицы или из боковой панели (rooms)."""
     base = SCHEDULE.get(day.weekday(), [])
     items = []
     for num in range(1, max([len(base)] + list(changes)) + 1):
@@ -1898,7 +1901,8 @@ def merge_day(day: date, changes: dict):
             old = fmt(d["os"], d["ot"], d["oa"])
             new = fmt(d["ns"], d["nt"], d["na"])
             if new and new != old:
-                text, was = ("урок снят" if new.lower().startswith("урок снят") else new), plan
+                new_full = fmt_new(d, num, rooms) if rooms else new  # то же, но с кабинетом из боковой панели
+                text, was = ("урок снят" if new.lower().startswith("урок снят") else new_full), plan
         if not text:
             continue
         if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1:
@@ -1910,11 +1914,11 @@ def merge_day(day: date, changes: dict):
 
 def make_schedule_reply(day: date, fun_on: bool = False, compare: bool = True) -> str:
     item = find_pdf(day)
-    changes, info = {}, None
+    changes, info, rooms = {}, None, []
     if item is not None:
-        changes, info = lessons_of(download(item))
+        changes, info, rooms = lessons_of(download(item))
     lines = []
-    items = merge_day(day, changes)
+    items = merge_day(day, changes, rooms)
     for nums, text, was in items:
         label = f"Урок {nums[0]}" if len(nums) == 1 else f"Уроки {nums[0]}–{nums[-1]}"
         if text == "урок снят":
