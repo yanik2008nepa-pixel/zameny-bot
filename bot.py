@@ -191,6 +191,8 @@ def _subj_key(x):
 
 
 TEACHER_OF = {_subj_key(k): v for k, v in TEACHERS}
+# Предметы с постоянным местом, независимо от преподавателя (если в файле замен кабинета нет).
+SUBJECT_ROOMS = {_subj_key("Физ.культ. и здоровье"): "спортзал"}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("zameny")
@@ -749,10 +751,22 @@ def collect_group(rows, code):
     return lessons, raw, groups
 
 
+def room_str(r):
+    """«каб. 205», а для спортзала и т.п. (не номер) - просто «спортзал»."""
+    r = str(r).strip()
+    return f"каб. {r}" if r[:1].isdigit() else r
+
+
+def room_html(r):
+    """То же, но с жирным номером (HTML)."""
+    r = str(r).strip()
+    return f"каб. <b>{esc_html(r)}</b>" if r[:1].isdigit() else f"<b>{esc_html(r)}</b>"
+
+
 def fmt(subj, teach, aud):
     """Пара одной строкой: «Предмет (Препод, каб. 205)». Если кабинет не указан, он не пишется."""
     s = " / ".join(uniq(subj))
-    extra = uniq(teach) + [f"каб. {a}" for a in uniq(aud)]
+    extra = uniq(teach) + [room_str(a) for a in uniq(aud)]
     if extra:
         s = f"{s} ({', '.join(extra)})" if s else ", ".join(extra)
     return s
@@ -873,7 +887,8 @@ def subject_room(plan, num, rooms):
     None - нет преподавателя в базе или нет кабинета в файле."""
     surname = TEACHER_OF.get(_subj_key(plan))
     if not surname:
-        return None
+        place = SUBJECT_ROOMS.get(_subj_key(plan))
+        return ("", place) if place else None
     sn = _norm(surname)
     for r in rooms or []:
         if r["name"] == sn and num in r["lessons"]:
@@ -886,7 +901,9 @@ def subject_room(plan, num, rooms):
 def room_by_subject(plan, num, rooms):
     """Пара по расписанию: «Фамилия И.О., каб. N» или None."""
     r = subject_room(plan, num, rooms)
-    return f"{r[0]}, каб. {r[1]}" if r else None
+    if not r:
+        return None
+    return f"{r[0]}, {room_str(r[1])}" if r[0] else room_str(r[1])
 
 
 def find_room(teacher, num, rooms):
@@ -914,9 +931,9 @@ def fmt_new(d, num, rooms):
     if not any(found.values()):
         return fmt(d["ns"], d["nt"], d["na"])
     if len(teach) == 1:
-        extra = [f"{teach[0]}, каб. {found[teach[0]]}"]
+        extra = [f"{teach[0]}, {room_str(found[teach[0]])}"]
     else:
-        extra = ["; ".join(f"{t} — каб. {found[t]}" if found[t] else t for t in teach)]
+        extra = ["; ".join(f"{t} — {room_str(found[t])}" if found[t] else t for t in teach)]
     s = " / ".join(uniq(d["ns"]))
     return f"{s} ({', '.join(extra)})"
 
@@ -2022,15 +2039,15 @@ def same_with_room(plan, d, num, rooms):
     teach = uniq(d["nt"]) or uniq(d["ot"])
     auds = uniq(d["na"]) or uniq(d["oa"])
     if auds:  # кабинет прямо в таблице
-        extra = uniq(teach) + [f"каб. {a}" for a in auds]
+        extra = uniq(teach) + [room_str(a) for a in auds]
         return f"{plan} ({', '.join(extra)})" if plan else ", ".join(extra)
     found = {t: find_room(t, num, rooms or []) for t in teach}
     if not any(found.values()):
         return plan
     if len(teach) == 1:
-        extra = f"{teach[0]}, каб. {found[teach[0]]}"
+        extra = f"{teach[0]}, {room_str(found[teach[0]])}"
     else:
-        extra = "; ".join(f"{t} — каб. {found[t]}" if found[t] else t for t in teach)
+        extra = "; ".join(f"{t} — {room_str(found[t])}" if found[t] else t for t in teach)
     return f"{plan} ({extra})" if plan else extra
 
 
@@ -2058,7 +2075,8 @@ def merge_day(day: date, changes: dict, rooms=None):
         if was is None and text == plan and not d:  # пары нет в файле замен: по расписанию, преподаватель из базы
             if r := room_by_subject(plan, num, rooms):
                 text = f"{plan} ({r})"
-        if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1:
+        if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1 \
+                and num % 2 == 0:  # склеиваем только внутри пары: 1-2, 3-4, ...
             items[-1][0].append(num)
         else:
             items.append(([num], text, was))
@@ -3990,10 +4008,24 @@ def break_triggers(day):
     return out
 
 
+ROOM_JOKES_PLACE = [   # когда следующая пара не в кабинете с номером, а, например, в спортзале
+    "Следующая остановка: {room}. Форму не забыл? Хотя бы совесть.",
+    "Перемена кончается, а тебе в другое место — {room}. Беги, пока не стало хуже.",
+    "Новая локация: {room}. Квест «успей до звонка» продолжается.",
+    "Тебя ждёт {room}. Размяться полезно, особенно после лекций.",
+    "Сегодня обойдёмся без парты: {room}.",
+    "Пора менять место жительства на ближайшие 45 минут: {room}.",
+    "Курс выживания продолжается. Следующая точка: {room}.",
+    "Кто не успел, тот опоздал. Кто опоздал, тот отжимается. Место: {room}.",
+]
+
+
 def room_message(n, subj, room, teacher=None):
     """Текст в формате HTML (отправлять с parse_mode="HTML"): номер кабинета выделен жирным."""
-    joke = random.choice(ROOM_JOKES).format(room=f"<b>{esc_html(room)}</b>")
-    return f"{joke}\n\n🚪 Урок {n}: {esc_html(subj)}\n\n📍 Каб. <b>{esc_html(room)}</b>"
+    numeric = str(room).strip()[:1].isdigit()
+    joke = random.choice(ROOM_JOKES if numeric else ROOM_JOKES_PLACE).format(room=f"<b>{esc_html(room)}</b>")
+    where = f"Каб. <b>{esc_html(room)}</b>" if numeric else f"<b>{esc_html(str(room).capitalize())}</b>"
+    return f"{joke}\n\n🚪 Урок {n}: {esc_html(subj)}\n\n📍 {where}"
 
 
 _rooms_done = {"day": "", "keys": set()}
@@ -4095,7 +4127,7 @@ def _hm(hhmm):
 
 def _where(subj, room):
     """Предмет и кабинет (HTML): номер кабинета жирным."""
-    return f"{esc_html(subj)}, " + (f"каб. <b>{esc_html(room)}</b>" if room else "кабинет не указан")
+    return f"{esc_html(subj)}, " + (room_html(room) if room else "кабинет не указан")
 
 
 def _rooms_prep(day):
@@ -4122,6 +4154,26 @@ def _rooms_prep(day):
     return item, changes, info, rooms, slots, alive, b, last
 
 
+def _pair_entries(slots, last):
+    """Уроки по парам (1-2, 3-4, ...). Два урока пары с одинаковым предметом и кабинетом идут одной записью,
+    с разными кабинетами (или предметами) - отдельными записями по урокам.
+    [{'ns': [номера], 'g': урок, 'from': кабинет прошлой записи при смене кабинета | None}]"""
+    out, prev = [], None
+    for first in range(1, last + 1, 2):
+        grp = [slots[n] for n in (first, first + 1) if n in slots]
+        if not grp:
+            continue
+        key = lambda g: (g["cancel"], g["subj"], g["room"], g["replaced"])
+        same = len(grp) == 2 and key(grp[0]) == key(grp[1])
+        for part in ([grp] if same else [[g] for g in grp]):
+            g = part[0]
+            changed = prev if (not g["cancel"] and g["room"] and prev and g["room"] != prev) else None
+            out.append({"ns": [x["n"] for x in part], "g": g, "from": changed})
+            if not g["cancel"]:
+                prev = g["room"]
+    return out
+
+
 def rooms_now(day, now=None):
     """Коротко (HTML): время, текущая пара и кабинет, следующая пара. Для не сегодняшнего дня - первая пара."""
     now = now or datetime.now(TZ)
@@ -4130,16 +4182,27 @@ def rooms_now(day, now=None):
 
     def line(n, cur_room):
         sl = slots[n]
-        r = f"🚪 каб. <b>{esc_html(sl['room'])}</b>" if sl["room"] else "🚪 кабинет не указан"
-        mark = (f"  🔀 <i>было {esc_html(cur_room)}</i>"
+        r = f"🚪 {room_html(sl['room'])}" if sl["room"] else "🚪 кабинет не указан"
+        mark = (f"  🔀 <i>было {esc_html(room_str(cur_room))}</i>"
                 if cur_room and sl["room"] and cur_room != sl["room"] else "")
         return f"{esc_html(sl['subj'])}\n{r}{mark}"
 
-    if day != now.date():
-        first = next((n for n in alive if n in b), None)
+    if day != now.date():  # другой день: все пары дня коротко
         out = [f"📅 <b>{DAYS[day.weekday()].capitalize()}, {day:%d.%m}</b>", ""]
-        out.append(f"<b>Первая пара</b> (в {_hm(b[first][0])}):\n{line(first, None)}" if first else "Занятий нет")
-        return "\n".join(out)
+        for e in _pair_entries(slots, last):
+            ns, g = e["ns"], e["g"]
+            label = f"Урок {ns[0]}" if len(ns) == 1 else f"Уроки {ns[0]}–{ns[-1]}"
+            if g["cancel"]:
+                out.append(f"❌ <b>{label}:</b> урок снят")
+                continue
+            r = room_html(g["room"]) if g["room"] else "кабинет не указан"
+            mark = f"  🔀 <i>было {esc_html(room_str(e['from']))}</i>" if e["from"] else ""
+            out.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}:</b> {esc_html(g['subj'])}\n🚪 {r}{mark}\n")
+        if len(out) == 2:
+            out.append("Занятий нет")
+        if item is None:
+            out.append("ℹ️ Файла замен на этот день пока нет: показано по расписанию.")
+        return "\n".join(out).rstrip()
 
     in_lesson = next((n for n in alive if n in b and _mins(b[n][0]) <= cur_min < _mins(b[n][1])), None)
     done = [k for k in alive if k in b and _mins(b[k][1]) <= cur_min]
@@ -4227,42 +4290,27 @@ def rooms_view(day, now=None):
             elif in_lesson:
                 lines.append("🏁 Это последняя пара на сегодня")
         lines.append("")
-    else:
-        nl = nxt_line(None, None, "➡️ Первая пара:")
-        if nl:
-            lines += [nl, ""]
 
     # --- по парам: 1-2, 3-4, 5-6, ...; в паре разные кабинеты - показываем уроки отдельно
-    prev = None
     info_done = False
     info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])}): {esc_html(info)}"
                  if info and day.weekday() == 3 else None)
     any_change = False
-    for first in range(1, last + 1, 2):
-        grp = [slots[n] for n in (first, first + 1) if n in slots]
-        if not grp:
+    for e in _pair_entries(slots, last):
+        ns, g = e["ns"], e["g"]
+        label = f"Урок {ns[0]}" if len(ns) == 1 else f"Уроки {ns[0]}–{ns[-1]}"
+        times = ", ".join(tm(n) for n in ns if tm(n))
+        label += f" ({times})" if times else ""
+        if info_line and not info_done and ns[0] >= 6:
+            lines.append(info_line + "\n")
+            info_done = True
+        if g["cancel"]:
+            lines.append(f"❌ <b>{label}</b>: урок снят\n")
             continue
-        same = len(grp) == 2 and all(
-            (g["cancel"], g["subj"], g["room"], g["replaced"]) == (grp[0]["cancel"], grp[0]["subj"], grp[0]["room"], grp[0]["replaced"])
-            for g in grp)
-        parts = [grp] if same else [[g] for g in grp]
-        for part in parts:
-            ns = [g["n"] for g in part]
-            label = f"Урок {ns[0]}" if len(ns) == 1 else f"Уроки {ns[0]}–{ns[-1]}"
-            times = ", ".join(tm(n) for n in ns if tm(n))
-            label += f" ({times})" if times else ""
-            g = part[0]
-            if info_line and not info_done and ns[0] >= 6:
-                lines.append(info_line + "\n")
-                info_done = True
-            if g["cancel"]:
-                lines.append(f"❌ <b>{label}</b>: урок снят\n")
-                continue
-            mark = ""
-            if g["room"] and prev and g["room"] != prev:
-                mark, any_change = f" 🔀 (было каб. {esc_html(prev)})", True
-            lines.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}</b>:\n{_where(g['subj'], g['room'])}{mark}\n")
-            prev = g["room"]
+        mark = ""
+        if e["from"]:
+            mark, any_change = f" 🔀 (было {esc_html(room_str(e['from']))})", True
+        lines.append(f"{'🔄 ' if g['replaced'] else ''}<b>{label}</b>:\n{_where(g['subj'], g['room'])}{mark}\n")
     if info_line and not info_done:
         lines.append(info_line)
     if not slots:
