@@ -93,6 +93,30 @@ SCHEDULE = {
         "МНиЭПА", "МНиЭПА"],
 }
 
+# База преподавателей по расписанию группы: предмет -> фамилия. Нужна, чтобы у пар, которых нет в файле замен,
+# найти кабинет преподавателя в боковой панели файла. Предмет пишется как в SCHEDULE (регистр, точки и пробелы не важны).
+# Хочешь добавить преподавателя: ("Предмет", "Фамилия"). Предмета нет в списке - кабинет у такой пары не пишем.
+TEACHERS = [
+    ("Деловые коммуникации", "Друщиц"),
+    ("Электропривод", "Короткая"),
+    ("Основы автоматики", "Царикевич"),
+    ("Осн.теории надежности", "Царикевич"),
+    ("Основы теории надежности", "Царикевич"),
+    ("Электронная техника", "Окулич"),
+    ("УиСПИ", "Окулич"),
+    ("МиСИ", "Окулич"),
+    ("МНиЭПА", "Окулич"),
+    ("Цифр.и микропр.техника", "Кузьмич"),
+    ("Защ нас. и терр от ЧС", "Стрига"),
+]
+
+
+def _subj_key(x):
+    return re.sub(r"[^а-яa-z0-9]", "", x.lower().replace("ё", "е"))
+
+
+TEACHER_OF = {_subj_key(k): v for k, v in TEACHERS}
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("zameny")
 
@@ -707,39 +731,47 @@ def _room_text(r):
     return re.sub(r"\s+", " ", r.strip())
 
 
+def _disp(name, init):
+    """«Царикевич» + « М.И.» -> «Царикевич М.И.»."""
+    return (name + " " + re.sub(r"\s+", "", init or "")).strip() if init and init.strip() else name
+
+
 def parse_rooms(tails):
-    """Список записей [{'name', 'init', 'lessons', 'room'}] из текста справа от таблицы.
+    """Список записей [{'name', 'init', 'disp', 'lessons', 'room'}] из текста справа от таблицы.
     Понимает оба вида записи: «Горбова Г.И. 402 (3-6)» и «Иванов И.И. (1-4, 6) 205»."""
     out = []
-    last = None  # (фамилия, инициалы) для строк-продолжений вида «307 (7-8)»
+    last = None  # (фамилия, инициалы, как показывать) для строк-продолжений вида «307 (7-8)»
+
+    def set_last(name, init):
+        nonlocal last
+        last = (_norm(name), re.sub(r"[^а-яё]", "", _norm(init or "")), _disp(name, init))
+
+    def add(lessons, room):
+        if last and lessons and room:
+            out.append({"name": last[0], "init": last[1], "disp": last[2],
+                        "lessons": lessons, "room": _room_text(room)})
+
     for ln in tails:
         ln = ln.strip()
         n_before = len(out)
         found = list(NAME_ROOM.finditer(ln))
         for m in found:
-            lessons = _lesson_set(m.group(4))
-            last = (_norm(m.group(1)), re.sub(r"[^а-яё]", "", _norm(m.group(2))))
-            if lessons:
-                out.append({"name": last[0], "init": last[1], "lessons": lessons, "room": _room_text(m.group(3))})
+            set_last(m.group(1), m.group(2))
+            add(_lesson_set(m.group(4)), m.group(3))
             # остаток строки после первой записи: «... 307 (7-8)» - ещё кабинеты того же преподавателя
-            rest_from = m.end()
-            for m2 in ROOM_ONLY.finditer(ln, rest_from):
+            for m2 in ROOM_ONLY.finditer(ln, m.end()):
                 if any(f.start() <= m2.start() < f.end() for f in found):
                     continue
-                les2 = _lesson_set(m2.group(2))
-                if les2:
-                    out.append({"name": last[0], "init": last[1], "lessons": les2, "room": _room_text(m2.group(1))})
+                add(_lesson_set(m2.group(2)), m2.group(1))
         if found:
             continue
         mo = NAME_ONLY.match(ln)
         if mo:  # строка только с фамилией: кабинеты будут на следующей строке
-            last = (_norm(mo.group(1)), re.sub(r"[^а-яё]", "", _norm(mo.group(2))))
+            set_last(mo.group(1), mo.group(2))
             continue
         cont = list(ROOM_ONLY.finditer(ln)) if last and not ENTRY.search(ln) else []
         for m2 in cont:
-            les2 = _lesson_set(m2.group(2))
-            if les2:
-                out.append({"name": last[0], "init": last[1], "lessons": les2, "room": _room_text(m2.group(1))})
+            add(_lesson_set(m2.group(2)), m2.group(1))
         if cont:
             continue
         # формат 2 (старый): «Иванов И.И. (1-4, 6) 205»
@@ -753,12 +785,24 @@ def parse_rooms(tails):
                 before = ROOM_ANY.findall(ln[prev_end:m.start()])
                 room = before[-1] if before else None
             prev_end = m.end()
-            last = (_norm(m.group(1)), re.sub(r"[^а-яё]", "", _norm(m.group(2))))
-            if lessons and room:
-                out.append({"name": last[0], "init": last[1], "lessons": lessons, "room": room})
+            set_last(m.group(1), m.group(2))
+            add(parse_lesson_set(m.group(3)), room)
         if not found2 and len(out) == n_before:
             last = None  # посторонняя строка: продолжение больше не относится к прошлой фамилии
     return out
+
+
+def room_by_subject(plan, num, rooms):
+    """Пара по расписанию: преподавателя берём из TEACHERS (по названию предмета), кабинет - из боковой панели.
+    Возвращает «Фамилия И.О., каб. N» или None (нет преподавателя в базе или нет кабинета в файле)."""
+    surname = TEACHER_OF.get(_subj_key(plan))
+    if not surname or not rooms:
+        return None
+    sn = _norm(surname)
+    for r in rooms:
+        if r["name"] == sn and num in r["lessons"]:
+            return f"{r['disp']}, каб. {r['room']}"
+    return None
 
 
 def find_room(teacher, num, rooms):
@@ -1923,8 +1967,13 @@ def merge_day(day: date, changes: dict, rooms=None):
                 text, was = ("урок снят" if new.lower().startswith("урок снят") else new_full), plan
             elif new and plan:
                 text = same_with_room(plan, d, num, rooms)  # по расписанию, но кабинет указан в файле замен
+                if text == plan and (r := room_by_subject(plan, num, rooms)):
+                    text = f"{plan} ({r})"
         if not text:
             continue
+        if was is None and text == plan and not d:  # пары нет в файле замен: по расписанию, преподаватель из базы
+            if r := room_by_subject(plan, num, rooms):
+                text = f"{plan} ({r})"
         if items and items[-1][1] == text and items[-1][2] == was and items[-1][0][-1] == num - 1:
             items[-1][0].append(num)
         else:
