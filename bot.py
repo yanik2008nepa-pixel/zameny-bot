@@ -27,6 +27,7 @@
   /site [дата]      - что бот видит на сайте колледжа: ссылки и найденные файлы замен (диагностика) (только для ADMIN_IDS)
   /setfile ссылка   - добавить ссылку на файл/папку Google Диска как источник замен; /clearfiles - убрать (только для ADMIN_IDS)
   /roomsoff         - выключить кабинеты на перемене до 00:00 с уведомлением включившим; повторно - вернуть (только для ADMIN_IDS)
+  /roomcheck [дата] - диагностика кабинетов на перемене: что бот видит и что отправит по каждой перемене (только для ADMIN_IDS)
   /roomtest [каб.]  - показать пример сообщения «кабинет на перемене» (только для ADMIN_IDS)
   /mykey            - свой статус доступа
 Группы и каналы: бота можно добавить в группу/канал - там он ничего не отвечает, только шлёт уведомления о заменах.
@@ -2688,6 +2689,7 @@ def menu_markup(chat_id: int = 0) -> InlineKeyboardMarkup:
     B = InlineKeyboardButton
     return InlineKeyboardMarkup([
         [B("📅 Расписание", callback_data="menu:s")],
+        [B("🚪 Кабинеты", callback_data="menu:k")],
         [B("🔔 Звонки", callback_data="menu:b")],
         [B("🔔 Уведомления", callback_data="menu:n")],
         [B(f"🔀 Сравнение с расписанием: {'вкл' if get_cmp(chat_id) else 'выкл'}", callback_data="menu:c")],
@@ -2722,6 +2724,21 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif act == "s":    # расписание
         track(update, cat="расписание", when=datetime.now(TZ))
         await _edit(q, SCHEDULE_TEXT, schedule_markup(back=True))
+    elif act in ("k", "kt"):    # кабинеты на сегодня / на завтра с учётом замен
+        track(update, cat="кабинеты", when=datetime.now(TZ))
+        today = datetime.now(TZ).date()
+        day = next_workday(today) if (act == "kt" or today.weekday() == 6) else today
+        B = InlineKeyboardButton
+        other = (B("Сегодня", callback_data="menu:k") if act == "kt" or today.weekday() == 6 else
+                 B("Завтра", callback_data="menu:kt"))
+        kb = InlineKeyboardMarkup([[other], [B(BACK_LABEL, callback_data=MENU_BACK)]])
+        await _edit(q, "⏳ Смотрю замены…", kb)
+        try:
+            text = await asyncio.to_thread(rooms_view, day)
+        except Exception:  # noqa: BLE001
+            log.exception("кабинеты: не удалось собрать")
+            text = "Не получилось получить кабинеты 😕 Попробуй чуть позже или открой «Пары»."
+        await _edit(q, text[:4000], kb)
     elif act in ("b", "bt", "bs"):    # расписание звонков: «b» - как сегодня, «bt» - четверг, «bs» - остальные дни
         track(update, cat="звонки", when=datetime.now(TZ))
         thu = (datetime.now(TZ).weekday() == 3) if act == "b" else act == "bt"
@@ -3975,6 +3992,20 @@ def room_message(n, subj, room, teacher=None):
 
 
 _rooms_done = {"day": "", "keys": set()}
+ROOM_LATE_MIN = 2   # если тик таймера пропал, всё равно напишем, пока с начала перемены прошло не больше стольких минут
+
+
+def room_decision(day, n, changes, rooms):
+    """Решение для перемены перед уроком n: (писать?, (предмет, кабинет) следующей пары, (предмет, кабинет) текущей, причина)."""
+    nxt = lesson_room(day, n, changes, rooms)
+    cur = lesson_room(day, n - 1, changes, rooms) if n - 1 in bells_for(day) else None
+    if not nxt:
+        return False, nxt, cur, "следующего урока нет или он снят"
+    if not nxt[1]:
+        return False, nxt, cur, "кабинет следующей пары неизвестен"
+    if cur and cur[1] and cur[1] == nxt[1]:
+        return False, nxt, cur, "кабинет не меняется"
+    return True, nxt, cur, "кабинет меняется" if (cur and cur[1]) else "кабинет прошлой пары неизвестен"
 
 
 async def rooms_job(context: ContextTypes.DEFAULT_TYPE):
@@ -3985,33 +4016,114 @@ async def rooms_job(context: ContextTypes.DEFAULT_TYPE):
         return
     if DATA["rooms_off"].get("day") == day.isoformat():
         return  # админ выключил кабинеты до 00:00
-    n = break_triggers(day).get(now.strftime("%H:%M"))
-    if not n:
+    cur_min = now.hour * 60 + now.minute
+    todo = []
+    for hhmm, n in break_triggers(day).items():
+        late = cur_min - (int(hhmm[:2]) * 60 + int(hhmm[3:]))
+        if 0 <= late <= ROOM_LATE_MIN:
+            todo.append(n)
+    if not todo:
         return
     due = rooms_subscribers()  # только личка, группы и каналы не получают
     if not due:
         return
     if _rooms_done["day"] != day.isoformat():
         _rooms_done["day"], _rooms_done["keys"] = day.isoformat(), set()
-    if n in _rooms_done["keys"]:
+    todo = [n for n in todo if n not in _rooms_done["keys"]]
+    if not todo:
         return
-    _rooms_done["keys"].add(n)  # отмечаем заранее: не высылаем дважды
+    _rooms_done["keys"].update(todo)  # отмечаем заранее: не высылаем дважды
     try:
         item = await asyncio.to_thread(find_pdf, day)
         changes, rooms = {}, []
         if item is not None:
             changes, _, rooms = await asyncio.to_thread(lambda: lessons_of(download(item)))
     except Exception:  # noqa: BLE001
-        log.exception("кабинет на перемене: не удалось прочитать файл замен")
-        _rooms_done["keys"].discard(n)  # попробуем в следующую минуту
+        log.exception("кабинет на перемене: не удалось прочитать файл замен, считаю по расписанию")
+        changes, rooms = {}, []  # постоянные кабинеты и расписание всё равно известны
+    for n in todo:
+        send, nxt, cur, why = room_decision(day, n, changes, rooms)
+        log.info("кабинет на перемене, урок %s: %s (%s), получателей %s", n, "пишу" if send else "молчу", why, len(due))
+        if send:
+            await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due)
+
+
+async def roomcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/roomcheck [дата] - админу: как бот видит кабинеты по перемене, что бы он отправил и почему (диагностика)."""
+    if not _admin_only(update):
+        await update.message.reply_text(not_admin_text(update))
         return
-    nxt = lesson_room(day, n, changes, rooms)
-    if not nxt or not nxt[1]:
-        return  # урока нет, он снят или кабинет неизвестен
-    cur = lesson_room(day, n - 1, changes, rooms) if n - 1 in bells_for(day) else None
-    if cur and cur[1] and cur[1] == nxt[1]:
-        return  # кабинет не меняется
-    await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due)
+    today = datetime.now(TZ).date()
+    day, _ = parse_day(" ".join(context.args or []), today)
+    day = day or today
+    uid = update.effective_user.id
+    lines = [f"🔎 Кабинеты на перемене, {day:%d.%m.%Y} ({DAYS[day.weekday()]})",
+             f"Принудительно выключено до 00:00: {'да 🚫' if rooms_forced_off() else 'нет'}",
+             f"Включено у {len(rooms_subscribers())} чел.; у тебя: {'да' if get_pref(uid)['rooms'] else 'нет'}; "
+             f"доступ у тебя: {'есть' if has_access(uid) else 'НЕТ'}"]
+    changes, rooms = {}, []
+    try:
+        item = await asyncio.to_thread(find_pdf, day)
+        if item is None:
+            lines.append("Файл замен на этот день: не найден (считаю по расписанию и постоянным кабинетам)")
+        else:
+            changes, _, rooms = await asyncio.to_thread(lambda: lessons_of(download(item)))
+            lines.append(f"Файл замен: {item.get('name', '?')}, кабинетов в боковой панели: {len(rooms)}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"Файл замен не прочитался: {e!r}")
+    lines.append("")
+    for hhmm, n in sorted(break_triggers(day).items()):
+        send, nxt, cur, why = room_decision(day, n, changes, rooms)
+        c = f"{cur[0]} — {cur[1] or '?'}" if cur else "—"
+        x = f"{nxt[0]} — {nxt[1] or '?'}" if nxt else "—"
+        lines.append(f"{hhmm} → урок {n}: {'✅ напишу' if send else '⏭ молчу'} ({why})\n    было: {c}\n    станет: {x}")
+    await update.message.reply_text("\n".join(lines)[:4000], reply_markup=KEYBOARD)
+
+
+def rooms_view(day):
+    """Кабинеты и время по парам на день с учётом замен. Где кабинет меняется - 🔀, замена - 🔄."""
+    item = find_pdf(day)
+    changes, info, rooms = {}, None, []
+    if item is not None:
+        changes, info, rooms = lessons_of(download(item))
+    b = bells_for(day)
+    base = SCHEDULE.get(day.weekday(), [])
+    last = max([len(base)] + list(changes))
+    lines = [f"🚪 Кабинеты на {day:%d.%m.%Y} ({DAYS[day.weekday()]}), с учётом замен", ""]
+    prev, any_change, info_done = None, False, False
+    info_line = (f"🕐 Информационный час ({INFO_HOUR_THU[0].lstrip('0')}–{INFO_HOUR_THU[1].lstrip('0')}): {info}"
+                 if info and day.weekday() == 3 else None)
+    for n in range(1, last + 1):
+        if info_line and n == 6:  # в четверг информационный час стоит между 5 и 6 уроком
+            lines.append(info_line)
+            info_done = True
+        t = f" ({b[n][0].lstrip('0')}–{b[n][1].lstrip('0')})" if n in b else ""
+        lr = lesson_room(day, n, changes, rooms)
+        d = changes.get(n)
+        if not lr:
+            if d and fmt(d["ns"], d["nt"], d["na"]).lower().startswith("урок снят"):
+                lines.append(f"❌ Урок {n}{t}: урок снят")
+            continue
+        subj, room = lr
+        replaced = bool(d and fmt(d["ns"], d["nt"], d["na"]) and
+                        fmt(d["ns"], d["nt"], d["na"]) != fmt(d["os"], d["ot"], d["oa"]))
+        mark = ""
+        if room and prev and room != prev:
+            mark, any_change = f" 🔀 (было каб. {prev})", True
+        lines.append(f"{'🔄 ' if replaced else ''}Урок {n}{t}: {subj} — "
+                     + (f"каб. {room}" if room else "кабинет не указан") + mark)
+        prev = room
+    if info_line and not info_done:
+        lines.append(info_line)
+    if len(lines) == 2:
+        lines.append("Занятий нет.")
+    lines.append("")
+    lines.append("🔀 — кабинет меняется · 🔄 — замена")
+    if any_change:
+        lines.append("В начале перемены могу напомнить про новый кабинет: «⚙️ Другое» → «🔔 Уведомления» → «Кабинет на перемене».")
+    if item is None:
+        lines.append("ℹ️ Файл замен на этот день пока не найден: показано по расписанию и постоянным кабинетам преподавателей.")
+    return "\n".join(lines)
 
 
 ROOMS_OFF_TEXT = "По технической причине уведомление о кабинетах принудительно выключено. Кабинеты есть в заменах."
@@ -4092,6 +4204,7 @@ def main():
     app.add_handler(CommandHandler("site", site_cmd))
     app.add_handler(CommandHandler("roomtest", roomtest_cmd))
     app.add_handler(CommandHandler("roomsoff", roomsoff_cmd))
+    app.add_handler(CommandHandler("roomcheck", roomcheck_cmd))
     app.add_handler(CommandHandler("setfile", setfile_cmd))
     app.add_handler(CommandHandler("clearfiles", clearfiles_cmd))
     app.add_handler(CommandHandler("groups", groups_cmd))
