@@ -3994,10 +3994,24 @@ def lesson_room(day, num, changes, rooms):
     return plan, (sr[1] if sr else None)
 
 
+FIRST_ROOM_TIME = "08:00"   # во сколько напоминать про кабинет первой пары
+
+
+def first_lesson(day, changes, rooms):
+    """(номер, (предмет, кабинет)) первого не снятого урока дня или (None, None)."""
+    for n in sorted(bells_for(day)):
+        lr = lesson_room(day, n, changes, rooms)
+        if lr:
+            return n, lr
+    return None, None
+
+
 def break_triggers(day):
     """{'HH:MM': номер урока, к которому идти}: начало перемены перед уроком (перед уроком 1 перемены нет).
     В четверг перед 6 уроком пишем в начале перемены после информационного часа."""
     b, out = bells_for(day), {}
+    if 1 in b:
+        out[FIRST_ROOM_TIME] = 1   # утреннее напоминание про кабинет первой пары
     for n in sorted(b):
         if n == 1:
             continue
@@ -4034,6 +4048,13 @@ ROOM_LATE_MIN = 2   # если тик таймера пропал, всё рав
 
 def room_decision(day, n, changes, rooms):
     """Решение для перемены перед уроком n: (писать?, (предмет, кабинет) следующей пары, (предмет, кабинет) текущей, причина)."""
+    if n == 1:  # утро: перемены нет, сравнивать не с чем - просто говорим, где первая пара
+        _, nxt = first_lesson(day, changes, rooms)
+        if not nxt:
+            return False, nxt, None, "занятий нет"
+        if not nxt[1]:
+            return False, nxt, None, "кабинет первой пары неизвестен"
+        return True, nxt, None, "утреннее напоминание о первой паре"
     nxt = lesson_room(day, n, changes, rooms)
     cur = lesson_room(day, n - 1, changes, rooms) if n - 1 in bells_for(day) else None
     if not nxt:
@@ -4082,6 +4103,8 @@ async def rooms_job(context: ContextTypes.DEFAULT_TYPE):
         send, nxt, cur, why = room_decision(day, n, changes, rooms)
         log.info("кабинет на перемене, урок %s: %s (%s), получателей %s", n, "пишу" if send else "молчу", why, len(due))
         if send:
+            if n == 1:
+                n = first_lesson(day, changes, rooms)[0]
             await broadcast(context.bot, room_message(n, nxt[0], nxt[1]), ids=due, parse_mode="HTML")
 
 
