@@ -2114,10 +2114,10 @@ def make_schedule_reply(day: date, fun_on: bool = False, compare: bool = True) -
         body += "\n\n" + random.choice([
             "Замен нет, всё по расписанию.", "Замен нет — живём по плану 👌",
             "Всё по расписанию, сюрпризов нет.", "Замен нет. Редкая удача, пользуйся 😄"])
-    if info:
+    if info or day.weekday() == 3:  # в четверг информационный час есть всегда
         body += "\n\n🕐 Информационный час" + (
             f" ({INFO_HOUR_THU[0].lstrip('0')}–{INFO_HOUR_THU[1].lstrip('0')})"
-            if SHOW_TIMES and day.weekday() == 3 else "")
+            if SHOW_TIMES and day.weekday() == 3 else "") + (f": {info}" if info else "")
     if fun_on:
         if not lines:
             kind = "noclasses"
@@ -4231,8 +4231,8 @@ def rooms_now(day, now=None):
     if in_lesson:
         out.append(f"<b>Сейчас:</b> {line(in_lesson, None)}")
         cur_room = slots[in_lesson]["room"]
-    elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
-        out.append(f"<b>Сейчас:</b> информационный час\n🚪 {esc_html(info)}")
+    elif day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
+        out.append("<b>Сейчас:</b> информационный час" + (f"\n🚪 {esc_html(info)}" if info else ""))
         cur_room = slots[done[-1]]["room"] if done else None
     elif not coming:
         out.append("Занятия на сегодня закончились 🎉" if done else "Занятий сегодня нет")
@@ -4285,8 +4285,9 @@ def rooms_view(day, now=None):
             status = (f"📍 Сейчас {hh}: идёт урок {in_lesson} (до {_hm(b[in_lesson][1])}, осталось {left} мин)\n"
                       f"   {_where(sl['subj'], sl['room'])}")
             after, cur_room = in_lesson, sl["room"]
-        elif info and day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
-            status = f"📍 Сейчас {hh}: информационный час (до {_hm(INFO_HOUR_THU[1])})\n   {esc_html(info)}"
+        elif day.weekday() == 3 and _mins(INFO_HOUR_THU[0]) <= cur_min < _mins(INFO_HOUR_THU[1]):
+            status = (f"📍 Сейчас {hh}: информационный час (до {_hm(INFO_HOUR_THU[1])})"
+                      + (f"\n   {esc_html(info)}" if info else ""))
             after = done[-1] if done else None
             cur_room = slots[after]["room"] if after else None
         elif not coming:
@@ -4308,8 +4309,8 @@ def rooms_view(day, now=None):
 
     # --- по парам: 1-2, 3-4, 5-6, ...; в паре разные кабинеты - показываем уроки отдельно
     info_done = False
-    info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])}): {esc_html(info)}"
-                 if info and day.weekday() == 3 else None)
+    info_line = (f"🕐 Информационный час ({_hm(INFO_HOUR_THU[0])}–{_hm(INFO_HOUR_THU[1])})"
+                 + (f": {esc_html(info)}" if info else "") if day.weekday() == 3 else None)
     any_change = False
     for e in _pair_entries(slots, last):
         ns, g = e["ns"], e["g"]
