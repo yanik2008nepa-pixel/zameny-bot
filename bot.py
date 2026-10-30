@@ -607,6 +607,12 @@ async def setfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Добавил источник замен:\n" + "\n".join(lines)
                                     + "\n\nБот ищет в нём файл с датой в имени (например 14.10.2026.pdf). Проверка: /site",
                                     reply_markup=KEYBOARD)
+    global _last_check
+    _last_check = 0.0       # новый источник: проверяем замены сразу, не дожидаясь очередного круга таймера
+    try:
+        await watch_job(context)
+    except Exception:  # noqa: BLE001
+        log.exception("проверка замен после /setfile не удалась")
 
 
 async def clearfiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3008,6 +3014,22 @@ async def broadcast_groups(bot, text: str, imgs=None):
         await asyncio.sleep(0.05)
 
 
+def _ping_self():
+    import urllib.request
+    url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if url:
+        try:
+            urllib.request.urlopen(url.rstrip("/") + "/", timeout=20).read(1)
+        except Exception:  # noqa: BLE001  - ответ 404 тоже годится: главное, что запрос дошёл и сервис не уснул
+            pass
+
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
+    """Каждые 10 минут обращаемся к своему адресу: бесплатный Render засыпает после ~15 минут без запросов,
+    а пока он спит, таймеры бота (проверка замен, напоминания) не работают."""
+    await asyncio.to_thread(_ping_self)
+
+
 async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     """Смотрит, не появился ли/не изменился ли файл на завтра.
     Пн-сб с 8:00 до 16:00 - каждую минуту, в остальное время - раз в 5 минут."""
@@ -3070,6 +3092,36 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE):
         if not closed:
             await broadcast_groups(context.bot, f"{head}\n\n{text}")
     await broadcast_hint(context.bot)  # у кого уведомления выключены: только «Есть замены»
+    await send_pairs_after_changes(context.bot, day, recipients)
+
+
+TOMORROW_INTRO = "Исходя из замен, завтра:"
+
+
+async def send_pairs_after_changes(bot, day, recipients=None):
+    """После рассылки замен: подписчикам в личку (не в группы и каналы) - «Исходя из замен, завтра:»
+    в одном сообщении с пометкой пары на этот день с учётом замен (первое сообщение рассылки - фото замен)."""
+    ids = [c for c in (DATA["subs"] if recipients is None else recipients) if c > 0]
+    if not ids:
+        return
+    cache = {}
+    for cid in ids:
+        if is_banned(cid) or not has_access(cid):
+            continue
+        cmp_on = get_cmp(cid)
+        if cmp_on not in cache:
+            try:
+                cache[cmp_on] = await asyncio.to_thread(make_schedule_reply, day, False, cmp_on)
+            except Exception:  # noqa: BLE001
+                log.exception("не удалось собрать пары на %s после замен", day)
+                return
+        try:
+            await bot.send_message(cid, (TOMORROW_INTRO + "\n\n" + cache[cmp_on])[:4000], reply_markup=KEYBOARD)
+        except (Forbidden, BadRequest):
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось отправить пары после замен %s", cid)
+        await asyncio.sleep(0.05)
 
 
 def due_list(now: datetime, kind: str) -> list:
@@ -4542,6 +4594,7 @@ def main():
         log.warning("JobQueue недоступен: установите python-telegram-bot[job-queue,webhooks]")
     else:
         app.job_queue.run_repeating(watch_job, interval=CHECK_FAST, first=30)
+        app.job_queue.run_repeating(keepalive_job, interval=600, first=60)  # не даём Render уснуть
         app.job_queue.run_repeating(rooms_job, interval=60, first=15)  # кабинет на перемене (кому включено)
         app.job_queue.run_repeating(morning_job, interval=60, first=20)  # расписание на день, у каждого своё время
         app.job_queue.run_repeating(evening_job, interval=60, first=25)  # расписание на завтра, у каждого своё время
